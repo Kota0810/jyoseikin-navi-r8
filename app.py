@@ -369,7 +369,7 @@ def build_gemini_contents(messages: list, current_prompt: str) -> list:
 # =============================================================
 # AI応答処理（共通関数化）
 # =============================================================
-MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 def send_and_stream(prompt: str) -> bool:
     """ユーザーの質問を処理してストリーミング応答を返す共通関数。成功時True"""
