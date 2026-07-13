@@ -177,10 +177,17 @@ def get_relevant_chunks(query: str, pdf_chunks: list, max_chunks: int = 3) -> st
 # =============================================================
 def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases, relevant_chunks):
     form_data = form_map.get(selected_form, {})
+    today = date.today()
+    reiwa_year = today.year - 2018
+    today_str = f"{today.year}年{today.month}月{today.day}日（令和{reiwa_year}年{today.month}月{today.day}日）"
     return f"""
 あなたは『{selected_grant}』専門の助成金申請サポートAIです。
 公式資料に基づいた専門的な知識をもとに、ユーザーが申請書を正確に完成できるよう伴走支援してください。
 なお、あなたはAIであるため、専門家（社会保険労務士等）としての法的責任は負えません。回答はあくまでサポート情報としてご活用ください。
+
+【本日の日付】{today_str}
+※ 現在の年月日は必ず上記を基準にしてください。あなたの学習データ上の年ではなく、上記の日付が「今日」です。
+※ 「今年」「来年」「今年度」等の相対表現や、日付の過去・未来の判定は、すべて上記の本日の日付を基準に解釈すること。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【最重要：対話の鉄則】
