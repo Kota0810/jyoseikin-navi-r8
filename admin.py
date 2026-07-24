@@ -14,6 +14,13 @@ def _year_label(app_year: str) -> str:
     return {"R7": "令和7年度版", "R8": "令和8年度版"}.get(app_year or "R7", app_year or "R7")
 
 
+# 管理画面のナビゲーション項目（st.radio で切替。プログラムからの遷移に対応）
+NAV_USERS = "👥 ユーザー管理"
+NAV_CONVERSATIONS = "💬 会話履歴閲覧"
+NAV_STATS = "📊 利用統計"
+NAV_OPTIONS = [NAV_USERS, NAV_CONVERSATIONS, NAV_STATS]
+
+
 def render_admin_page():
     """管理画面のメインレンダリング関数（app.py から呼び出す）"""
     require_admin()
@@ -30,24 +37,24 @@ def render_admin_page():
     st.caption(f"ログイン中: {st.session_state.display_name}（管理者）")
     st.divider()
 
-    tab1, tab2, tab3 = st.tabs(["👥 ユーザー管理", "💬 会話履歴閲覧", "📊 利用統計"])
+    # ── ナビゲーション ──
+    # 他ビュー（利用統計など）からのジャンプ要求があれば、ラジオ生成前に反映する
+    if "admin_nav_pending" in st.session_state:
+        st.session_state["admin_nav"] = st.session_state.pop("admin_nav_pending")
 
-    # ==========================================================
-    # タブ1: ユーザー管理
-    # ==========================================================
-    with tab1:
+    nav = st.radio(
+        "メニュー",
+        NAV_OPTIONS,
+        key="admin_nav",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if nav == NAV_USERS:
         _render_user_management()
-
-    # ==========================================================
-    # タブ2: 会話履歴閲覧
-    # ==========================================================
-    with tab2:
+    elif nav == NAV_CONVERSATIONS:
         _render_conversation_viewer()
-
-    # ==========================================================
-    # タブ3: 利用統計
-    # ==========================================================
-    with tab3:
+    else:
         _render_usage_stats()
 
 
@@ -83,6 +90,22 @@ def _render_user_management():
     if not users:
         st.info("ユーザーが登録されていません。")
         return
+
+    # 会社名・IDで検索
+    search = st.text_input(
+        "🔍 会社名・ログインIDで検索",
+        key="user_mgmt_search",
+        placeholder="社名やIDの一部を入力（空欄で全員表示）",
+    )
+    if search:
+        s = search.lower()
+        users = [
+            u for u in users
+            if s in u["display_name"].lower() or s in u["username"].lower()
+        ]
+        if not users:
+            st.warning("該当するユーザーが見つかりません。")
+            return
 
     for user in users:
         uid = user["id"]
@@ -152,14 +175,44 @@ def _render_conversation_viewer():
         st.info("ユーザーが登録されていません。")
         return
 
-    selected_user = st.selectbox(
-        "ユーザーを選択",
-        options=users,
-        format_func=lambda u: f"{u['display_name']} ({u['username']})",
-    )
+    user_by_id = {u["id"]: u for u in users}
 
-    if not selected_user:
+    # ── 会社名・IDで検索 ──
+    search = st.text_input(
+        "🔍 会社名・ログインIDで検索",
+        key="conv_search",
+        placeholder="社名やIDの一部を入力（空欄で全員表示）",
+    )
+    if search:
+        s = search.lower()
+        filtered = [
+            u for u in users
+            if s in u["display_name"].lower() or s in u["username"].lower()
+        ]
+    else:
+        filtered = users
+
+    if not filtered:
+        st.warning("該当するユーザーが見つかりません。検索条件を変えてください。")
         return
+
+    option_ids = [u["id"] for u in filtered]
+
+    # ── 利用統計からのジャンプ先ユーザーを選択状態にする（ウィジェット生成前）──
+    jump_id = st.session_state.pop("conv_target_user_id", None)
+    if jump_id is not None and jump_id in option_ids:
+        st.session_state["conv_user_select"] = jump_id
+    # 保存済みの選択が現在の候補に無ければリセット（検索で絞られた場合など）
+    if st.session_state.get("conv_user_select") not in option_ids:
+        st.session_state.pop("conv_user_select", None)
+
+    selected_id = st.selectbox(
+        "ユーザーを選択",
+        options=option_ids,
+        format_func=lambda uid: f"{user_by_id[uid]['display_name']} ({user_by_id[uid]['username']})",
+        key="conv_user_select",
+    )
+    selected_user = user_by_id[selected_id]
 
     convs = get_all_conversations_by_user(selected_user["id"], limit=100)
     if not convs:
@@ -205,7 +258,31 @@ def _render_usage_stats():
         st.info("データがありません。")
         return
 
-    df = pd.DataFrame(stats)
+    # ── 並び替えUI ──
+    SORT_OPTIONS = {
+        "登録日順（デフォルト）": None,
+        "表示名順":             "display_name",
+        "最終ログイン順":       "last_login_at",
+        "会話数順":             "total_conversations",
+        "メッセージ数順":       "total_messages",
+    }
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        sort_label = st.selectbox("並び替え", list(SORT_OPTIONS.keys()), key="stats_sort_key")
+    with c2:
+        descending = st.toggle("降順", value=True, key="stats_sort_desc")
+
+    sort_field = SORT_OPTIONS[sort_label]
+    stats_sorted = list(stats)
+    if sort_field in ("total_conversations", "total_messages"):
+        stats_sorted.sort(key=lambda s: s.get(sort_field) or 0, reverse=descending)
+    elif sort_field:
+        stats_sorted.sort(key=lambda s: str(s.get(sort_field) or ""), reverse=descending)
+
+    # 表示順に対応するユーザーIDリスト（行選択→ジャンプ用）
+    uids = [s["id"] for s in stats_sorted]
+
+    df = pd.DataFrame(stats_sorted)
     df = df.rename(columns={
         "username":            "ログインID",
         "display_name":        "表示名",
@@ -216,5 +293,28 @@ def _render_usage_stats():
     })
     df["有効"] = df["有効"].map({1: "✅", 0: "⛔"})
     df = df.drop(columns=["id"], errors="ignore")
+    df = df[["表示名", "ログインID", "有効", "最終ログイン", "会話数", "メッセージ数"]]
 
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.caption("💡 行を選択すると、その会社の会話履歴へ移動できます。")
+    event = st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+    )
+
+    sel = getattr(event, "selection", None)
+    rows = list(sel.rows) if sel and getattr(sel, "rows", None) else []
+    if rows:
+        pos = rows[0]
+        target_uid = uids[pos]
+        target_name = stats_sorted[pos]["display_name"]
+        if st.button(
+            f"💬 「{target_name}」の会話履歴に移動する",
+            type="primary",
+            use_container_width=True,
+        ):
+            st.session_state["admin_nav_pending"] = NAV_CONVERSATIONS
+            st.session_state["conv_target_user_id"] = target_uid
+            st.rerun()
