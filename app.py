@@ -882,6 +882,14 @@ elif st.session_state.app_state == "chat":
             f"<p class='form-title'>📋 {st.session_state.selected_form}</p>",
             unsafe_allow_html=True,
         )
+        # 免責（AIの出力任せにせず常に表示する）
+        st.markdown(
+            "<p style='color:gray;font-size:0.8em;margin:4px 0 0 0;'>"
+            "AIによる書類作成サポートです。"
+            "情報の正確性については保証されておりません。必要に応じて最新の公式情報をご確認ください。"
+            "</p>",
+            unsafe_allow_html=True,
+        )
 
         # 添削レポート（あれば表示）
         if st.session_state.review_result:
