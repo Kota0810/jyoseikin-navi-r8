@@ -94,17 +94,34 @@ def load_knowledge(domain_key: str, mtime: str = ""):
     return form_map, rules_and_cases, pdf_chunks, domain_config
 
 
+# 制度セレクトボックスの表示順（ここに書いた順に先頭へ並ぶ）
+# 未記載のドメインはこの後ろにフォルダ名順で自動的に並ぶため、
+# 新しいドメインを追加してもこのリストの変更は必須ではない。
+DOMAIN_DISPLAY_ORDER = [
+    "36協定",
+    "就業規則",
+]
+
+
+def _domain_sort_key(entry: str):
+    """DOMAIN_DISPLAY_ORDER に載っているものを先に、残りはフォルダ名順で並べる"""
+    if entry in DOMAIN_DISPLAY_ORDER:
+        return (0, DOMAIN_DISPLAY_ORDER.index(entry), "")
+    return (1, 0, entry)
+
+
 def scan_domains() -> dict:
     """domains/ フォルダをスキャンして {domain_key: display_name} の辞書を返す。
     必須JSON (domain_config / form_structures / basic_rules / pdf_chunks) が揃っているドメインのみ返す。
-    未完成のドメインを除外することで FileNotFoundError を防ぐ。"""
+    未完成のドメインを除外することで FileNotFoundError を防ぐ。
+    並び順は DOMAIN_DISPLAY_ORDER に従う（未記載はフォルダ名順で後ろに続く）。"""
     base_dir    = os.path.dirname(os.path.abspath(__file__))
     domains_dir = os.path.join(base_dir, "domains")
     required = ("domain_config.json", "form_structures.json", "basic_rules.json", "pdf_chunks.json")
     result = {}
     if not os.path.isdir(domains_dir):
         return result
-    for entry in sorted(os.listdir(domains_dir)):
+    for entry in sorted(os.listdir(domains_dir), key=_domain_sort_key):
         domain_dir = os.path.join(domains_dir, entry)
         if not os.path.isdir(domain_dir):
             continue
@@ -912,7 +929,11 @@ elif st.session_state.app_state == "chat":
                 st.rerun()
 
         # ── ユーザー入力欄（text_area: 2倍の高さ）────────────
-        st.markdown("**自由に質問してください。　右側の一覧から選択することも可能です。**")
+        # 右カラム（項目一覧）が出ているときだけ、その案内も添える
+        if form_items:
+            st.markdown("**自由に質問してください。　右側の一覧から選択することも可能です。**")
+        else:
+            st.markdown("**自由に質問してください。**")
         user_input = st.text_area(
             "入力欄",
             placeholder="例：離職率の計算方法は？ / ③(1)欄には何を書く？",
