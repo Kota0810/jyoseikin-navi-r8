@@ -1,0 +1,10 @@
+{
+  "display_name": "就業規則",
+  "applies_to_options": [
+    "新規作成",
+    "変更",
+    "全般"
+  ],
+  "form_to_stage": {},
+  "form_order": []
+}
