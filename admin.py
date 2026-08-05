@@ -15,9 +15,9 @@ def _year_label(app_year: str) -> str:
 
 
 # 管理画面のナビゲーション項目（st.radio で切替。プログラムからの遷移に対応）
-NAV_USERS = "👥 ユーザー管理"
-NAV_CONVERSATIONS = "💬 会話履歴閲覧"
-NAV_STATS = "📊 利用統計"
+NAV_USERS = "ユーザー管理"
+NAV_CONVERSATIONS = "会話履歴閲覧"
+NAV_STATS = "利用統計"
 NAV_OPTIONS = [NAV_USERS, NAV_CONVERSATIONS, NAV_STATS]
 
 
@@ -28,9 +28,9 @@ def render_admin_page():
     # ── ヘッダー & 戻るボタン ──────────────────────────────────
     col_h1, col_h2 = st.columns([4, 1])
     with col_h1:
-        st.markdown("## 🔧 管理画面")
+        st.markdown("<h2 class='admin-title'>管理画面</h2>", unsafe_allow_html=True)
     with col_h2:
-        if st.button("← アプリに戻る", use_container_width=True):
+        if st.button("アプリに戻る", use_container_width=True, key="admin_back"):
             st.session_state.app_state = "setup"
             st.rerun()
 
@@ -63,7 +63,7 @@ def render_admin_page():
 # =============================================================
 def _render_user_management():
     # ── 新規ユーザー追加 ──
-    with st.expander("＋ 新しいユーザーを追加"):
+    with st.expander("新しいユーザーを追加"):
         with st.form("add_user_form", clear_on_submit=True):
             new_username     = st.text_input("ログインID（英数字）")
             new_display      = st.text_input("表示名")
@@ -78,7 +78,7 @@ def _render_user_management():
                 try:
                     create_user(new_username, new_display or new_username,
                                 hash_password(new_password), new_is_admin)
-                    st.success(f"✅ ユーザー「{new_username}」を追加しました。")
+                    st.success(f"ユーザー「{new_username}」を追加しました。")
                     st.rerun()
                 except Exception as e:
                     st.error(f"追加失敗：{e}")
@@ -93,7 +93,7 @@ def _render_user_management():
 
     # 会社名・IDで検索
     search = st.text_input(
-        "🔍 会社名・ログインIDで検索",
+        "会社名・ログインIDで検索",
         key="user_mgmt_search",
         placeholder="社名やIDの一部を入力（空欄で全員表示）",
     )
@@ -112,8 +112,8 @@ def _render_user_management():
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
             c1.markdown(f"**{user['display_name']}**  \n`{user['username']}`")
-            c2.write("👑 管理者" if user["is_admin"] else "一般")
-            c3.write("✅ 有効" if user["is_active"] else "⛔ 無効")
+            c2.write("管理者" if user["is_admin"] else "一般")
+            c3.write("有効" if user["is_active"] else "無効")
 
             with c4:
                 btn_col1, btn_col2, btn_col3 = st.columns(3)
@@ -179,7 +179,7 @@ def _render_conversation_viewer():
 
     # ── 会社名・IDで検索 ──
     search = st.text_input(
-        "🔍 会社名・ログインIDで検索",
+        "会社名・ログインIDで検索",
         key="conv_search",
         placeholder="社名やIDの一部を入力（空欄で全員表示）",
     )
@@ -291,11 +291,11 @@ def _render_usage_stats():
         "total_conversations": "会話数",
         "total_messages":      "メッセージ数",
     })
-    df["有効"] = df["有効"].map({1: "✅", 0: "⛔"})
+    df["有効"] = df["有効"].map({1: "有効", 0: "無効"})
     df = df.drop(columns=["id"], errors="ignore")
     df = df[["表示名", "ログインID", "有効", "最終ログイン", "会話数", "メッセージ数"]]
 
-    st.caption("💡 行を選択すると、その会社の会話履歴へ移動できます。")
+    st.caption("行を選択すると、その会社の会話履歴へ移動できます。")
     event = st.dataframe(
         df,
         use_container_width=True,
@@ -311,7 +311,7 @@ def _render_usage_stats():
         target_uid = uids[pos]
         target_name = stats_sorted[pos]["display_name"]
         if st.button(
-            f"💬 「{target_name}」の会話履歴に移動する",
+            f"「{target_name}」の会話履歴に移動する",
             type="primary",
             use_container_width=True,
         ):
