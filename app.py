@@ -115,6 +115,26 @@ def render_sidebar_user(name: str) -> None:
     )
 
 
+def form_notice(domain_config: dict, form_name: str) -> str:
+    """様式ごとの注意書きを domain_config.json から引く。
+
+    法改正で様式が切り替わる時期をまたぐ場合など、どちらを使うべきかの
+    判断が利用者に委ねられる場面で使う。設定が無いドメインでは何も出ない。
+    """
+    for entry in domain_config.get("form_notices", []):
+        if form_name in entry.get("forms", []):
+            return entry.get("text", "")
+    return ""
+
+
+def render_form_notice(text: str) -> None:
+    if text:
+        st.markdown(
+            f"<div class='form-notice'>{html.escape(text)}</div>",
+            unsafe_allow_html=True,
+        )
+
+
 def section_label(text: str) -> None:
     """サイドバー等の小見出し（全角大文字風のセクションラベル）。"""
     st.markdown(f"<div class='sb-section'>{html.escape(text)}</div>", unsafe_allow_html=True)
@@ -270,6 +290,7 @@ def load_knowledge(domain_key: str, mtime: str = ""):
 DOMAIN_DISPLAY_ORDER = [
     "36協定",
     "就業規則",
+    "労働条件通知書",
 ]
 
 
@@ -839,6 +860,13 @@ footer, #MainMenu,
     margin: .55rem 0 0 !important; color: var(--ink-muted) !important;
     font-size: .84rem !important; line-height: 1.7 !important;
 }
+/* 様式ごとの注意書き（適用時期など、利用者の判断が要る事項） */
+.form-notice {
+    margin: .7rem 0 0; padding: .8rem 1rem;
+    background: var(--navy-tint); border: 1px solid var(--navy-line);
+    border-left: 3px solid var(--navy); border-radius: 8px;
+    color: var(--ink-sub); font-size: .84rem; line-height: 1.8;
+}
 
 /* ───────── ボタン ───────── */
 .stButton button, .stFormSubmitButton button, [data-testid="stBaseButton-primary"] {
@@ -1308,6 +1336,9 @@ elif st.session_state.app_state == "setup":
         selected_form  = st.selectbox(
             "様式", form_options, index=default_form_idx, label_visibility="collapsed",
         )
+        # 選択した様式に注意書きがあれば、その場で提示する
+        # （改正をまたぐ時期にどちらの様式を使うかは利用者の判断になるため）
+        render_form_notice(form_notice(_sel_cfg, selected_form))
         st.markdown(
             "<p class='field-note'>様式を特定すると、AIの回答精度と添削の正確さが向上します。</p>",
             unsafe_allow_html=True,

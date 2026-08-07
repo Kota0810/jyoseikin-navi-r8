@@ -104,7 +104,9 @@ def build_form_knowledge(domain_key: str):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(form_master, f, ensure_ascii=False, indent=2)
 
-    print(f"\n✅ 完了！『{output_path}』を作成しました。")
+    # 絵文字は Windows 日本語コンソール(cp932)でエンコードできず、
+    # 全処理が終わった最後の print で UnicodeEncodeError になるため使わない
+    print(f"\n完了：『{output_path}』を作成しました。")
 
 
 if __name__ == "__main__":
