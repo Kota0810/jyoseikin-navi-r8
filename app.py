@@ -10,7 +10,7 @@ from urllib.parse import quote
 from google.genai import Client, types
 from dotenv import load_dotenv
 from db import (
-    create_tables,
+    create_tables, SCHEMA_VERSION,
     create_conversation, add_message, touch_conversation,
     update_conversation_title,
     get_conversations_by_user, get_messages_by_conversation, get_conversation,
@@ -250,11 +250,15 @@ if not api_key:
 client = Client(api_key=api_key)
 
 # DB テーブルをアプリ起動時に1回だけ初期化（st.cache_resource でキャッシュ）
+# スキーマ版数を引数に取るのは、db.py 側のスキーマを変えたときに確実に
+# 再実行させるため。引数が無いと、この関数自身のコードが変わらない限り
+# キャッシュが効き続け、プロセスを使い回したままデプロイされた場合に
+# マイグレーションがスキップされる。
 @st.cache_resource
-def _init_db():
+def _init_db(schema_version: int):
     create_tables()
 
-_init_db()
+_init_db(SCHEMA_VERSION)
 
 
 # =============================================================
