@@ -246,7 +246,12 @@ def _render_user_management():
                         )
 
                     if res["no_match"]:
-                        with st.expander(f"Excel に該当が無かった登録ユーザー（{len(res['no_match'])}件）"):
+                        # ここは既に expander の中なので、さらに expander を入れ子にできない
+                        # （Streamlit の制約）。チェックボックスで開閉する。
+                        if st.checkbox(
+                            f"Excel に該当が無かった登録ユーザーを表示する（{len(res['no_match'])}件）",
+                            key="cno_show_nomatch",
+                        ):
                             st.dataframe(
                                 [{"表示名": x["user"]["display_name"],
                                   "ログインID": x["user"]["username"]} for x in res["no_match"]],
