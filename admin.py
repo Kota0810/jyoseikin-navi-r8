@@ -306,7 +306,9 @@ def _render_user_management():
     for user in users:
         uid = user["id"]
         with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
+            # ボタンが4つあるため、右側の取り分を広めにする
+            # （狭いと日本語ラベルが1文字ずつ縦に折り返される）
+            c1, c2, c3, c4 = st.columns([4, 1.2, 1.2, 4.6])
             # 顧客番号は管理画面にだけ出す（利用者側の画面には一切表示しない）
             _cno = user.get("customer_no") or ""
             c1.markdown(

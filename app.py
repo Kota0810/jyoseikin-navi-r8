@@ -975,6 +975,15 @@ footer, #MainMenu,
 }
 [data-testid="stWidgetLabel"] p { font-size: .8rem !important; font-weight: 600; color: var(--ink-sub); }
 
+/* 管理画面のユーザー一覧の操作ボタン。列が狭いので、日本語ラベルが
+   1文字ずつ縦に折り返らないよう、余白を詰めて折り返しを禁止する。 */
+[class*="st-key-cno_btn_"] .stButton button,
+[class*="st-key-pw_btn_"] .stButton button,
+[class*="st-key-toggle_"] .stButton button,
+[class*="st-key-del_"] .stButton button {
+    padding: .5rem .35rem !important; font-size: .8rem !important; white-space: nowrap;
+}
+
 /* 初期設定のフォームは白いカードにして中央に置く。
    左寄せのままだと中央寄せのヘッダーと軸がずれて、右側が非対称な空白になる。 */
 .st-key-setup_form {
