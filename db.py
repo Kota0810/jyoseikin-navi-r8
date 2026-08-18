@@ -86,10 +86,16 @@ def create_tables():
                 password_hash TEXT    NOT NULL,
                 is_admin      INTEGER NOT NULL DEFAULT 0,
                 is_active     INTEGER NOT NULL DEFAULT 1,
+                customer_no   TEXT    NOT NULL DEFAULT '',
                 created_at    TEXT    NOT NULL,
                 last_login_at TEXT
             )
             """)
+            # 既存DBへの追加（テーブルが既にある環境向けのマイグレーション）
+            cur.execute(
+                """ALTER TABLE users
+                   ADD COLUMN IF NOT EXISTS customer_no TEXT NOT NULL DEFAULT ''"""
+            )
             cur.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
                 id         SERIAL PRIMARY KEY,
@@ -148,15 +154,40 @@ def get_all_users() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def create_user(username: str, display_name: str, password_hash: str, is_admin: bool = False) -> int:
+def create_user(username: str, display_name: str, password_hash: str, is_admin: bool = False,
+                customer_no: str = "") -> int:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO users (username, display_name, password_hash, is_admin, created_at)
-                   VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-                (username, display_name, password_hash, int(is_admin), _now()),
+                """INSERT INTO users (username, display_name, password_hash, is_admin, customer_no, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                (username, display_name, password_hash, int(is_admin), customer_no, _now()),
             )
             return cur.fetchone()["id"]
+
+
+def update_customer_no(user_id: int, customer_no: str) -> None:
+    """顧客番号を更新する（管理画面からの個別修正・一括取込の両方で使う）"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET customer_no = %s WHERE id = %s",
+                (customer_no, user_id),
+            )
+
+
+def bulk_update_customer_no(pairs: list[tuple[int, str]]) -> int:
+    """(user_id, customer_no) をまとめて更新する。1トランザクションで実行し、
+    途中で失敗した場合は全件ロールバックされる。"""
+    if not pairs:
+        return 0
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE users SET customer_no = %s WHERE id = %s",
+                [(no, uid) for uid, no in pairs],
+            )
+            return len(pairs)
 
 
 def update_password(user_id: int, new_hash: str) -> None:

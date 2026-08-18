@@ -3,8 +3,12 @@ admin.py  –  管理画面 UI（ユーザー管理・会話履歴閲覧・利�
 """
 import streamlit as st
 from auth import require_admin, hash_password
+import re
+import unicodedata
+
 from db import (
     get_all_users, create_user, update_password, set_user_active, delete_user,
+    update_customer_no, bulk_update_customer_no,
     get_all_user_stats,
     get_all_conversations_by_user, get_messages_by_conversation,
 )
@@ -19,6 +23,9 @@ NAV_USERS = "ユーザー管理"
 NAV_CONVERSATIONS = "会話履歴閲覧"
 NAV_STATS = "利用統計"
 NAV_OPTIONS = [NAV_USERS, NAV_CONVERSATIONS, NAV_STATS]
+
+# 顧客番号の形式（C + 数字9桁）
+CUSTOMER_NO_RE = re.compile(r"C\d{9}")
 
 
 def render_admin_page():
@@ -59,29 +66,211 @@ def render_admin_page():
 
 
 # =============================================================
+# 顧客番号の一括取込（Excel の会社名 → 登録済み表示名 の突合）
+# =============================================================
+# 「株式会社◯◯（システム検索：株式会社 ◯◯）」のように、Excel 側に
+# システム上の表記が併記されている場合があるため、その表記も突合キーに使う。
+_SEARCH_HINT_RE = re.compile(r"[（(]\s*システム検索\s*[：:]\s*(.+?)\s*[）)]")
+
+
+def _norm_company(name: str) -> str:
+    """会社名の突合用キー。全角英数を半角化し、空白・記号ゆれを吸収する。"""
+    t = unicodedata.normalize("NFKC", name or "")
+    t = re.sub(r"[\s　]+", "", t)
+    return t.casefold()
+
+
+def _company_keys(raw_name: str) -> list[str]:
+    """1行の会社名から、突合に使うキー候補を返す（完全一致優先の順）。"""
+    keys = [raw_name.strip()]
+    m = _SEARCH_HINT_RE.search(raw_name)
+    if m:
+        keys.append(m.group(1).strip())                       # 併記されたシステム上の表記
+        keys.append(_SEARCH_HINT_RE.sub("", raw_name).strip())  # 併記部分を除いた表記
+    return [k for k in keys if k]
+
+
+def match_customer_numbers(rows: list[tuple[str, str]], users: list[dict]) -> dict:
+    """Excel の (顧客番号, 会社名) と登録ユーザーを突合する。
+
+    戻り値は判定済みの分類。DB へは書き込まない（呼び出し側が確認してから適用する）。
+      exact      : 表記が完全に一致
+      normalized : 全角半角・空白のゆれを吸収して一致（目視確認の対象）
+      ambiguous  : Excel 側に同名の会社が複数あり、顧客番号を決められない
+      no_match   : システムに登録があるが Excel に該当なし
+      unused     : Excel にあるがシステムに該当なし（件数のみ使う想定）
+    """
+    exact_map: dict[str, set] = {}
+    norm_map: dict[str, set] = {}
+    for cno, name in rows:
+        for k in _company_keys(name):
+            exact_map.setdefault(k, set()).add(cno)
+            norm_map.setdefault(_norm_company(k), set()).add(cno)
+
+    result = {"exact": [], "normalized": [], "ambiguous": [], "no_match": [], "unused": 0}
+    hit_numbers = set()
+
+    for u in users:
+        disp = (u.get("display_name") or "").strip()
+        for table, kind in ((exact_map, "exact"), (norm_map, "normalized")):
+            key = disp if kind == "exact" else _norm_company(disp)
+            nums = table.get(key)
+            if not nums:
+                continue
+            if len(nums) > 1:
+                result["ambiguous"].append({"user": u, "candidates": sorted(nums)})
+            else:
+                cno = next(iter(nums))
+                result[kind].append({"user": u, "customer_no": cno})
+                hit_numbers.add(cno)
+            break
+        else:
+            result["no_match"].append({"user": u})
+
+    result["unused"] = len({c for c, _ in rows} - hit_numbers)
+    return result
+
+
+# =============================================================
 # タブ1: ユーザー管理
 # =============================================================
 def _render_user_management():
     # ── 新規ユーザー追加 ──
     with st.expander("新しいユーザーを追加"):
         with st.form("add_user_form", clear_on_submit=True):
-            new_username     = st.text_input("ログインID（英数字）")
+            new_customer_no  = st.text_input("顧客番号", placeholder="C000000000")
             new_display      = st.text_input("表示名")
+            new_username     = st.text_input("ログインID（英数字）")
             new_password     = st.text_input("パスワード", type="password")
             new_is_admin     = st.checkbox("管理者権限を付与")
             add_submitted    = st.form_submit_button("追加", type="primary")
 
         if add_submitted:
+            new_customer_no = (new_customer_no or "").strip()
             if not new_username or not new_password:
                 st.error("ログインIDとパスワードは必須です。")
+            elif new_customer_no and not CUSTOMER_NO_RE.fullmatch(new_customer_no):
+                st.error("顧客番号は「C」＋数字9桁で入力してください（例：C000000000）。")
             else:
                 try:
                     create_user(new_username, new_display or new_username,
-                                hash_password(new_password), new_is_admin)
+                                hash_password(new_password), new_is_admin,
+                                customer_no=new_customer_no)
                     st.success(f"ユーザー「{new_username}」を追加しました。")
                     st.rerun()
                 except Exception as e:
                     st.error(f"追加失敗：{e}")
+
+    # ── 顧客番号の一括取込 ──
+    with st.expander("顧客番号を一括で取り込む（Excel）"):
+        st.caption(
+            "「顧客番号」「会社名」の2列を持つExcelを読み込み、"
+            "会社名と登録済みの表示名が一致するユーザーに顧客番号を割り当てます。"
+            "確認画面を挟むので、この時点ではまだ保存されません。"
+        )
+        up = st.file_uploader("Excelファイル", type=["xlsx", "xls"], key="cno_import_file")
+        overwrite = st.checkbox(
+            "既に顧客番号が入っているユーザーも上書きする", value=False, key="cno_overwrite"
+        )
+
+        if up is not None:
+            try:
+                import pandas as pd
+                df = pd.read_excel(up, dtype=str).fillna("")
+                df.columns = [str(c).strip() for c in df.columns]
+                missing = [c for c in ("顧客番号", "会社名") if c not in df.columns]
+                if missing:
+                    st.error(f"必要な列がありません：{missing}　（現在の列：{list(df.columns)}）")
+                else:
+                    rows = [
+                        (r["顧客番号"].strip(), r["会社名"].strip())
+                        for _, r in df.iterrows()
+                        if r["顧客番号"].strip() and r["会社名"].strip()
+                    ]
+                    bad_fmt = sorted({c for c, _ in rows if not CUSTOMER_NO_RE.fullmatch(c)})
+                    if bad_fmt:
+                        st.warning(
+                            f"「C」＋数字9桁の形式でない顧客番号が {len(bad_fmt)} 件あります："
+                            + "、".join(bad_fmt[:5]) + ("…" if len(bad_fmt) > 5 else "")
+                        )
+
+                    all_users = get_all_users()
+                    res = match_customer_numbers(rows, all_users)
+
+                    # 上書きしない設定なら、既に番号が入っているユーザーは対象から外す
+                    def _targets(kind):
+                        out = []
+                        for x in res[kind]:
+                            cur = (x["user"].get("customer_no") or "").strip()
+                            if cur and not overwrite:
+                                continue
+                            if cur == x["customer_no"]:
+                                continue  # 既に同じ番号なら更新不要
+                            out.append(x)
+                        return out
+
+                    t_exact, t_norm = _targets("exact"), _targets("normalized")
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("完全一致", len(res["exact"]))
+                    m2.metric("表記ゆれ一致", len(res["normalized"]))
+                    m3.metric("要確認", len(res["ambiguous"]))
+                    m4.metric("該当なし", len(res["no_match"]))
+
+                    if res["ambiguous"]:
+                        st.error(
+                            "Excel に同じ会社名が複数あり、顧客番号を決められないユーザーがいます。"
+                            "これらは取り込まれません。個別に設定してください。"
+                        )
+                        st.dataframe(
+                            [
+                                {"表示名": x["user"]["display_name"],
+                                 "候補の顧客番号": " / ".join(x["candidates"])}
+                                for x in res["ambiguous"]
+                            ],
+                            use_container_width=True, hide_index=True,
+                        )
+
+                    if res["normalized"]:
+                        st.warning(
+                            "全角・半角や空白のゆれを吸収して一致させたものです。"
+                            "別会社を取り違えていないか確認してください。"
+                        )
+                        st.dataframe(
+                            [
+                                {"表示名（システム）": x["user"]["display_name"],
+                                 "顧客番号": x["customer_no"]}
+                                for x in res["normalized"]
+                            ],
+                            use_container_width=True, hide_index=True,
+                        )
+
+                    if res["no_match"]:
+                        with st.expander(f"Excel に該当が無かった登録ユーザー（{len(res['no_match'])}件）"):
+                            st.dataframe(
+                                [{"表示名": x["user"]["display_name"],
+                                  "ログインID": x["user"]["username"]} for x in res["no_match"]],
+                                use_container_width=True, hide_index=True,
+                            )
+
+                    st.caption(
+                        f"Excel の {len(rows)} 行のうち、どの登録ユーザーにも割り当たらなかった顧客番号が "
+                        f"{res['unused']} 件あります（未登録の会社と思われます）。"
+                    )
+
+                    total = len(t_exact) + len(t_norm)
+                    st.divider()
+                    if total == 0:
+                        st.info("更新対象がありません。")
+                    else:
+                        st.write(f"**{total} 件**を更新します。")
+                        if st.button("この内容で取り込む", type="primary", key="cno_apply"):
+                            pairs = [(x["user"]["id"], x["customer_no"]) for x in t_exact + t_norm]
+                            n = bulk_update_customer_no(pairs)
+                            st.success(f"{n} 件の顧客番号を登録しました。")
+                            st.rerun()
+            except Exception as e:
+                st.error(f"読み込みに失敗しました：{e}")
 
     st.divider()
 
@@ -93,15 +282,17 @@ def _render_user_management():
 
     # 会社名・IDで検索
     search = st.text_input(
-        "会社名・ログインIDで検索",
+        "会社名・ログインID・顧客番号で検索",
         key="user_mgmt_search",
-        placeholder="社名やIDの一部を入力（空欄で全員表示）",
+        placeholder="社名・ID・顧客番号の一部を入力（空欄で全員表示）",
     )
     if search:
         s = search.lower()
         users = [
             u for u in users
-            if s in u["display_name"].lower() or s in u["username"].lower()
+            if s in u["display_name"].lower()
+            or s in u["username"].lower()
+            or s in (u.get("customer_no") or "").lower()
         ]
         if not users:
             st.warning("該当するユーザーが見つかりません。")
@@ -111,12 +302,22 @@ def _render_user_management():
         uid = user["id"]
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
-            c1.markdown(f"**{user['display_name']}**  \n`{user['username']}`")
+            # 顧客番号は管理画面にだけ出す（利用者側の画面には一切表示しない）
+            _cno = user.get("customer_no") or ""
+            c1.markdown(
+                f"**{user['display_name']}**  \n`{user['username']}`"
+                + (f"  \n`{_cno}`" if _cno else "  \n:orange[顧客番号 未設定]")
+            )
             c2.write("管理者" if user["is_admin"] else "一般")
             c3.write("有効" if user["is_active"] else "無効")
 
             with c4:
-                btn_col1, btn_col2, btn_col3 = st.columns(3)
+                btn_col0, btn_col1, btn_col2, btn_col3 = st.columns(4)
+
+                # 顧客番号の修正（一括取込の結果を個別に直せるようにしておく）
+                with btn_col0:
+                    if st.button("顧客番号", key=f"cno_btn_{uid}", use_container_width=True):
+                        st.session_state[f"cno_edit_{uid}"] = True
 
                 # パスワード変更
                 with btn_col1:
@@ -135,6 +336,24 @@ def _render_user_management():
                     if st.button("削除", key=f"del_{uid}", use_container_width=True,
                                  type="primary" if False else "secondary"):
                         st.session_state[f"del_confirm_{uid}"] = True
+
+            # 顧客番号の編集フォーム（展開時）
+            if st.session_state.get(f"cno_edit_{uid}"):
+                with st.form(f"cno_form_{uid}"):
+                    edit_cno = st.text_input(
+                        "顧客番号", value=_cno, placeholder="C000000000",
+                        help="空欄で保存すると未設定に戻します。",
+                    )
+                    cno_ok = st.form_submit_button("保存する")
+                if cno_ok:
+                    edit_cno = (edit_cno or "").strip()
+                    if edit_cno and not CUSTOMER_NO_RE.fullmatch(edit_cno):
+                        st.error("顧客番号は「C」＋数字9桁で入力してください（例：C000000000）。")
+                    else:
+                        update_customer_no(uid, edit_cno)
+                        st.session_state.pop(f"cno_edit_{uid}", None)
+                        st.success("顧客番号を更新しました。")
+                        st.rerun()
 
             # パスワード変更フォーム（展開時）
             if st.session_state.get(f"pw_edit_{uid}"):
