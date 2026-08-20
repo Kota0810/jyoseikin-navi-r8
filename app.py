@@ -706,7 +706,10 @@ def _start_scheduler():
         from apscheduler.schedulers.background import BackgroundScheduler
         from db import delete_old_conversations
         scheduler = BackgroundScheduler()
+        from db import delete_expired_jti
         scheduler.add_job(lambda: delete_old_conversations(days=90), "cron", hour=2, minute=0)
+        # 期限切れのSSOトークンIDを掃除する（保持し続ける意味がないため）
+        scheduler.add_job(delete_expired_jti, "cron", hour=2, minute=10)
         scheduler.start()
     except Exception:
         pass  # スケジューラー起動失敗はアプリ動作に影響させない
@@ -995,6 +998,21 @@ footer, #MainMenu,
 /* STEP 間の区切り。項目が続くと境目が無くて平坦に見えるため。 */
 .form-sep { height: 1px; background: var(--line); margin: 1.6rem 0 .2rem; }
 
+/* SSO 失敗時の案内。濃紺のログイン画面に載るため白系で組む。 */
+.sso-notice {
+    max-width: 34rem; margin: 0 auto 1rem; padding: .9rem 1.1rem;
+    background: rgba(255,255,255,.10); border: 1px solid rgba(255,255,255,.22);
+    border-left: 3px solid #FFFFFF; border-radius: 8px;
+    color: #FFFFFF; font-size: .86rem; line-height: 1.8;
+}
+.sso-back { max-width: 34rem; margin: 0 auto 1.2rem; text-align: center; }
+.sso-back a {
+    display: inline-block; padding: .55rem 1.4rem; border-radius: 8px;
+    background: #FFFFFF; color: var(--navy) !important;
+    font-size: .86rem; font-weight: 600; text-decoration: none;
+}
+.sso-back a:hover { background: #DDE5EF; }
+
 /* ログインフォームをカードとして見せる */
 [data-testid="stForm"] {
     border: 1px solid var(--line) !important; border-radius: 14px !important;
@@ -1208,10 +1226,36 @@ _defaults = {
     "pending_prompt":      "",
     "input_key":           0,
     "last_error":          "",
+    "sso_error":           "",
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+# =============================================================
+# SSO（他システムからの署名付きトークンによるログイン）
+# =============================================================
+# 未ログインのときだけ処理する。ログイン成立後は再実行されても
+# ここを通らないため、同じトークンが二重に処理されることはない。
+if not st.session_state.authenticated:
+    _sso_token = st.query_params.get("t")
+    if _sso_token:
+        import sso as _sso
+
+        _sso_user, _sso_err = _sso.authenticate(_sso_token)
+        if _sso_user:
+            st.session_state.authenticated = True
+            st.session_state.user_id      = _sso_user["id"]
+            st.session_state.display_name = _sso_user["display_name"]
+            st.session_state.is_admin     = bool(_sso_user["is_admin"])
+            st.session_state.app_state    = "setup"
+            st.session_state.sso_error    = ""
+        else:
+            st.session_state.sso_error = _sso_err
+        # トークンをURLから消す。ブラウザ履歴や再読み込みで再送されないようにする。
+        st.query_params.clear()
+        st.rerun()
 
 
 # =============================================================
@@ -1237,6 +1281,53 @@ if st.session_state.app_state == "login":
         unsafe_allow_html=True,
     )
     render_brand_header()
+
+    # ── SSO が失敗したときの案内 ──
+    # 期限切れは、アプリがスリープから復帰するのに時間がかかった場合に起きる。
+    # そのときは発行側へ戻せば新しいトークンが発行され、
+    # 起動済みのアプリに対して今度は成功する。
+    if st.session_state.sso_error:
+        import sso as _sso
+
+        _msgs = {
+            _sso.E_EXPIRED: (
+                "アプリの起動に時間がかかったため、ログイン用の有効期限が切れました。"
+                "お手数ですが、もう一度お試しください。"
+            ),
+            _sso.E_REPLAYED: (
+                "このログイン用リンクは既に使用済みです。"
+                "お手数ですが、もう一度お試しください。"
+            ),
+            _sso.E_NO_ACCOUNT: (
+                "書類作成AIエージェントは、ご契約いただいた企業様向けのサービスです。"
+                "ご利用をご希望の場合は、担当者までお問い合わせください。"
+            ),
+            _sso.E_NOT_ALLOWED: (
+                "このアカウントではご利用いただけません。担当者までお問い合わせください。"
+            ),
+            _sso.E_NOT_CONFIGURED: (
+                "外部システムからのログインは現在ご利用いただけません。"
+                "下記のIDとパスワードでログインしてください。"
+            ),
+        }
+        _msg = _msgs.get(
+            st.session_state.sso_error,
+            "ログインできませんでした。下記のIDとパスワードでログインしてください。",
+        )
+        st.markdown(
+            f"<div class='sso-notice'>{html.escape(_msg)}</div>", unsafe_allow_html=True
+        )
+
+        # 再試行で解決する種類の失敗にだけ、発行側へ戻る導線を出す。
+        # 契約が無い場合に戻しても同じ結果になるため出さない。
+        _back = _sso.return_url()
+        if _back and st.session_state.sso_error in (_sso.E_EXPIRED, _sso.E_REPLAYED):
+            st.markdown(
+                f"<div class='sso-back'><a href='{html.escape(_back)}' target='_self'>"
+                "もう一度ログインする</a></div>",
+                unsafe_allow_html=True,
+            )
+        st.session_state.sso_error = ""
 
     col_l, col_c, col_r = st.columns([1, 2, 1])
     with col_c:

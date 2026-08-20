@@ -9,3 +9,4 @@ APScheduler==3.10.4
 pandas
 psycopg2-binary
 xlrd
+pyjwt[crypto]

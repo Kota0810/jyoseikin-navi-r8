@@ -79,7 +79,7 @@ def get_conn():
 # キャッシュはデコレートした関数自身のコードでしか無効化されないため、
 # ここのスキーマだけ変えてもプロセスが生き残っているとマイグレーションが
 # 実行されない。スキーマを変更したら必ずこの値を +1 すること。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def create_tables():
@@ -132,6 +132,18 @@ def create_tables():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated  ON conversations(updated_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_app_year ON conversations(app_year)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv      ON messages(conversation_id)")
+            # SSO で使用済みのトークンID。同じトークンの再利用を防ぐ。
+            # jti を主キーにすることで、INSERT の衝突＝使用済みと判定できる。
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS sso_used_jti (
+                jti        TEXT NOT NULL PRIMARY KEY,
+                used_at    TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sso_jti_exp ON sso_used_jti(expires_at)"
+            )
             # 顧客番号の一意制約。SSO はこの番号でログイン先を特定するため、
             # 重複していると特定できない。
             # ただし未設定は空文字で保持しており、PostgreSQL では空文字も
@@ -237,6 +249,50 @@ def update_last_login(user_id: int) -> None:
                 "UPDATE users SET last_login_at = %s WHERE id = %s",
                 (_now(), user_id),
             )
+
+
+# =============================================================
+# SSO（他システムからのトークンによるログイン）
+# =============================================================
+def get_user_by_customer_no(customer_no: str) -> dict | None:
+    """顧客番号からアカウントを引く。customer_no には部分一意インデックスが
+    張られているため、該当は最大1件。"""
+    if not customer_no:
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE customer_no = %s", (customer_no,))
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def consume_jti(jti: str, expires_at: str) -> bool:
+    """トークンIDを使用済みとして記録する。既に使われていれば False を返す。
+
+    ★ この関数は必ず単独で呼び、単独でコミットさせること。
+      アカウント検索など後続処理と同じトランザクションに入れると、
+      後続で例外が出たときに記録ごとロールバックされ、
+      「弾いたトークンが再利用できる」状態になる。
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sso_used_jti (jti, used_at, expires_at) VALUES (%s, %s, %s)",
+                    (jti, _now(), expires_at),
+                )
+        return True
+    except psycopg2.IntegrityError:
+        # 主キー衝突 = 既に使用済み
+        return False
+
+
+def delete_expired_jti() -> int:
+    """有効期限を過ぎたトークンIDを削除する（日次バッチから呼ぶ）。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sso_used_jti WHERE expires_at < %s", (_now(),))
+            return cur.rowcount
 
 
 # =============================================================
