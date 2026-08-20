@@ -230,6 +230,65 @@ def update_last_login(user_id: int) -> None:
             )
 
 
+# =============================================================
+# 運用確認用の集計
+# =============================================================
+def get_customer_no_duplicates() -> list[dict]:
+    """同じ顧客番号を持つアカウントを返す。
+
+    SSO は顧客番号でアカウントを特定するため、重複があるとログイン先を
+    決められない。customer_no に UNIQUE 制約を張る前の確認に使う。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT customer_no,
+                          COUNT(*) AS cnt,
+                          STRING_AGG(display_name || '（' || username || '）', ' / '
+                                     ORDER BY id) AS accounts
+                     FROM users
+                    WHERE customer_no <> ''
+                    GROUP BY customer_no
+                   HAVING COUNT(*) > 1
+                    ORDER BY customer_no"""
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_customer_no_summary() -> dict:
+    """顧客番号の設定状況（全体 / 設定済み / 未設定）"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT COUNT(*)                                  AS total,
+                          COUNT(*) FILTER (WHERE customer_no <> '') AS with_no,
+                          COUNT(*) FILTER (WHERE customer_no =  '') AS without_no
+                     FROM users"""
+            )
+            return dict(cur.fetchone())
+
+
+def get_conversation_counts_by_year() -> list[dict]:
+    """年度別の会話数・メッセージ数・最終利用日。
+
+    旧年度版がどの程度使われているかを見るため（SSO の遷移先を
+    現行年度に固定してよいかの判断材料）。
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT c.app_year,
+                          COUNT(DISTINCT c.id) AS conversations,
+                          COUNT(m.id)          AS messages,
+                          MAX(c.updated_at)    AS last_used
+                     FROM conversations c
+                     LEFT JOIN messages m ON m.conversation_id = c.id
+                    GROUP BY c.app_year
+                    ORDER BY c.app_year"""
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
 def get_all_user_stats() -> list[dict]:
     """全ユーザーの利用統計（管理画面用）"""
     with get_conn() as conn:

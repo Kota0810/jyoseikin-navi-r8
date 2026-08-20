@@ -9,6 +9,8 @@ import unicodedata
 from db import (
     get_all_users, create_user, update_password, set_user_active, delete_user,
     update_customer_no, bulk_update_customer_no,
+    get_customer_no_duplicates, get_customer_no_summary,
+    get_conversation_counts_by_year,
     get_all_user_stats,
     get_all_conversations_by_user, get_messages_by_conversation,
 )
@@ -544,3 +546,62 @@ def _render_usage_stats():
             st.session_state["admin_nav_pending"] = NAV_CONVERSATIONS
             st.session_state["conv_target_user_id"] = target_uid
             st.rerun()
+
+    _render_system_info()
+
+
+# =============================================================
+# 利用統計タブの末尾: 運用確認用のシステム情報
+# =============================================================
+def _render_system_info():
+    st.divider()
+    st.markdown("<h3 class='admin-title'>システム情報</h3>", unsafe_allow_html=True)
+
+    # ── 顧客番号の設定状況 ──
+    st.markdown("**顧客番号の設定状況**")
+    try:
+        summary = get_customer_no_summary()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("アカウント総数", summary["total"])
+        c2.metric("顧客番号あり", summary["with_no"])
+        c3.metric("顧客番号なし", summary["without_no"])
+    except Exception as e:
+        st.error(f"取得に失敗しました：{e}")
+
+    # ── 顧客番号の重複（SSO でアカウントを特定できなくなるため事前に潰す）──
+    try:
+        dups = get_customer_no_duplicates()
+        if dups:
+            st.error(
+                f"同じ顧客番号のアカウントが {len(dups)} 組あります。"
+                "SSO はこの番号でログイン先を決めるため、重複したままでは特定できません。"
+                "どちらかを修正してください。"
+            )
+            st.dataframe(
+                [{"顧客番号": d["customer_no"], "件数": d["cnt"], "該当アカウント": d["accounts"]}
+                 for d in dups],
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.success("顧客番号の重複はありません。")
+    except Exception as e:
+        st.error(f"重複チェックに失敗しました：{e}")
+
+    # ── 年度別の利用状況 ──
+    st.markdown("")
+    st.markdown("**年度別の利用状況**")
+    st.caption("旧年度版がどの程度使われているかの確認用です。")
+    try:
+        rows = get_conversation_counts_by_year()
+        if rows:
+            st.dataframe(
+                [{"年度": _year_label(r["app_year"]),
+                  "会話数": r["conversations"],
+                  "メッセージ数": r["messages"],
+                  "最終利用日": (r["last_used"] or "")[:10]} for r in rows],
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("会話データがありません。")
+    except Exception as e:
+        st.error(f"取得に失敗しました：{e}")
