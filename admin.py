@@ -6,6 +6,7 @@ from auth import require_admin, hash_password
 import re
 import unicodedata
 
+from version import BUILD_LABEL
 from db import (
     get_all_users, create_user, update_password, set_user_active, delete_user,
     update_customer_no, bulk_update_customer_no,
@@ -43,7 +44,10 @@ def render_admin_page():
             st.session_state.app_state = "setup"
             st.rerun()
 
-    st.caption(f"ログイン中: {st.session_state.display_name}（管理者）")
+    # ビルド表記。デプロイが反映されているかを画面から判別するために出す。
+    st.caption(
+        f"ログイン中: {st.session_state.display_name}（管理者）　｜　ビルド: {BUILD_LABEL}"
+    )
     st.divider()
 
     # ── ナビゲーション ──
