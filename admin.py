@@ -31,6 +31,17 @@ NAV_OPTIONS = [NAV_USERS, NAV_CONVERSATIONS, NAV_STATS]
 CUSTOMER_NO_RE = re.compile(r"C\d{9}")
 
 
+def _is_duplicate_error(e: Exception) -> bool:
+    """顧客番号の一意制約違反かどうか。
+
+    DB 側に部分一意インデックス idx_users_customer_no を張っているため、
+    既に使われている番号を設定しようとすると例外になる。
+    利用者には生のDBエラーではなく、原因が分かる文言を出す。
+    """
+    text = str(e)
+    return "idx_users_customer_no" in text or "unique" in text.lower()
+
+
 def render_admin_page():
     """管理画面のメインレンダリング関数（app.py から呼び出す）"""
     require_admin()
@@ -165,7 +176,13 @@ def _render_user_management():
                     st.success(f"ユーザー「{new_username}」を追加しました。")
                     st.rerun()
                 except Exception as e:
-                    st.error(f"追加失敗：{e}")
+                    if _is_duplicate_error(e):
+                        st.error(
+                            f"顧客番号「{new_customer_no}」は既に他のアカウントで使われています。"
+                            "顧客番号は1社につき1つです。"
+                        )
+                    else:
+                        st.error(f"追加失敗：{e}")
 
     # ── 顧客番号の一括取込 ──
     with st.expander("顧客番号を一括で取り込む（Excel）"):
@@ -281,7 +298,13 @@ def _render_user_management():
                             st.success(f"{n} 件の顧客番号を登録しました。")
                             st.rerun()
             except Exception as e:
-                st.error(f"読み込みに失敗しました：{e}")
+                if _is_duplicate_error(e):
+                    st.error(
+                        "取り込もうとした顧客番号の中に、既に他のアカウントで"
+                        "使われているものがあります。取込は行われていません。"
+                    )
+                else:
+                    st.error(f"読み込みに失敗しました：{e}")
 
     st.divider()
 
@@ -363,10 +386,20 @@ def _render_user_management():
                     if edit_cno and not CUSTOMER_NO_RE.fullmatch(edit_cno):
                         st.error("顧客番号は「C」＋数字9桁で入力してください（例：C000000000）。")
                     else:
-                        update_customer_no(uid, edit_cno)
-                        st.session_state.pop(f"cno_edit_{uid}", None)
-                        st.success("顧客番号を更新しました。")
-                        st.rerun()
+                        try:
+                            update_customer_no(uid, edit_cno)
+                        except Exception as e:
+                            if _is_duplicate_error(e):
+                                st.error(
+                                    f"顧客番号「{edit_cno}」は既に他のアカウントで使われています。"
+                                    "顧客番号は1社につき1つです。"
+                                )
+                            else:
+                                st.error(f"更新に失敗しました：{e}")
+                        else:
+                            st.session_state.pop(f"cno_edit_{uid}", None)
+                            st.success("顧客番号を更新しました。")
+                            st.rerun()
 
             # パスワード変更フォーム（展開時）
             if st.session_state.get(f"pw_edit_{uid}"):

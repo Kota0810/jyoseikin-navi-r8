@@ -79,7 +79,7 @@ def get_conn():
 # キャッシュはデコレートした関数自身のコードでしか無効化されないため、
 # ここのスキーマだけ変えてもプロセスが生き残っているとマイグレーションが
 # 実行されない。スキーマを変更したら必ずこの値を +1 すること。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def create_tables():
@@ -132,6 +132,15 @@ def create_tables():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated  ON conversations(updated_at)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_app_year ON conversations(app_year)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv      ON messages(conversation_id)")
+            # 顧客番号の一意制約。SSO はこの番号でログイン先を特定するため、
+            # 重複していると特定できない。
+            # ただし未設定は空文字で保持しており、PostgreSQL では空文字も
+            # 通常の値として扱われるため、単純な UNIQUE では未設定どうしが
+            # 衝突してしまう。空文字を除いた部分インデックスにする。
+            cur.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_users_customer_no
+                       ON users (customer_no) WHERE customer_no <> ''"""
+            )
 
 
 # =============================================================
