@@ -8,4 +8,4 @@ Streamlit Cloud はプロセスを使い回すことがあり、push しても�
 ★ デプロイのたびにこの値を更新すること。
 """
 
-BUILD_LABEL = "2026-08-20d SSO戻り導線"
+BUILD_LABEL = "2026-08-20e SSO検証テスト安定化"

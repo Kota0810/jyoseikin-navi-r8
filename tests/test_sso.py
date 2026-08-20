@@ -95,8 +95,31 @@ results.append(check("exp が無い", make(drop="exp"), False, sso.E_BAD_TOKEN))
 results.append(check("未登録の顧客番号", make(sub="C000009999"), False, sso.E_NO_ACCOUNT))
 results.append(check("無効化されたアカウント", make(sub="C000000002"), False, sso.E_NOT_ALLOWED))
 results.append(check("管理者アカウント（顧客番号あり）", make(sub="C000000003"), False, sso.E_NOT_ALLOWED))
-results.append(check("改ざんされたトークン（末尾1文字変更）",
-                     make()[:-1] + ("A" if make()[-1] != "A" else "B"), False, sso.E_BAD_TOKEN))
+# 署名の「末尾1文字」を変える方法は使わない。RS256 の署名は 2048bit で、
+# base64url の最後の1文字は下位2ビットしか意味を持たず、残りのビットは
+# デコード時に無視される。そのため文字を変えても署名バイト列が変わらず、
+# 検証を通ってしまうことがある（改ざんできていない状態を検査してしまう）。
+import base64 as _b64t, json as _jt
+
+def _seg(x):
+    return _b64t.urlsafe_b64decode(x + "=" * (-len(x) % 4))
+
+def _mk(b):
+    return _b64t.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+# (1) ペイロードの顧客番号を他社にすり替える（本命の攻撃）
+_h, _p2, _sg = make().split(".")
+_claims = _jt.loads(_seg(_p2))
+_claims["sub"] = "C000000003"          # 管理者の顧客番号にすり替える
+_swapped = f"{_h}.{_mk(_jt.dumps(_claims).encode())}.{_sg}"
+results.append(check("顧客番号を他社にすり替えたトークン", _swapped, False, sso.E_BAD_TOKEN))
+
+# (2) 署名の中間バイトを1つ反転させる（確実に署名バイト列が変わる）
+_h3, _p3, _s3 = make().split(".")
+_sig_bytes = bytearray(_seg(_s3))
+_sig_bytes[len(_sig_bytes) // 2] ^= 0xFF
+_bitflip = f"{_h3}.{_p3}.{_mk(bytes(_sig_bytes))}"
+results.append(check("署名を1バイト反転させたトークン", _bitflip, False, sso.E_BAD_TOKEN))
 
 # HS256 混入（公開鍵を共通鍵とみなした署名偽造）。
 # PyJWT は encode を拒むため、攻撃者と同じように手で組み立てる。
