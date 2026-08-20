@@ -68,7 +68,7 @@ def make(sub="C000000001", *, priv=PRIV, kid=KID, iss=ISS, aud=AUD,
 
 
 def check(label, token, want_ok, want_err=None):
-    user, err = sso.authenticate(token)
+    user, err, _ret = sso.authenticate(token)
     ok = (user is not None)
     good = (ok == want_ok) and (want_err is None or err == want_err)
     print(f"  {'OK ' if good else 'NG '} {label:<44} -> "
@@ -124,10 +124,52 @@ results.append(check("alg=none（署名なし）", none_tok, False, sso.E_BAD_TO
 print()
 t = make(sub="C000009999")                     # 未登録 → 拒否されるが jti は消費されるはず
 sso.authenticate(t)
-u2, e2 = sso.authenticate(t)
+u2, e2, _ = sso.authenticate(t)
 consumed = (e2 == sso.E_REPLAYED)
 print(f"  {'OK ' if consumed else 'NG '} 弾いたトークンも消費済みになっている       -> {e2}")
 results.append(consumed)
+
+# ── ret（戻り先URL）の扱い ──
+print()
+def ret_of(token):
+    return sso.authenticate(token)[2]
+
+def make_ret(ret, **kw):
+    now = datetime.now(tz=timezone.utc)
+    p = {"iss": ISS, "aud": AUD, "sub": "C000000001",
+         "iat": int(now.timestamp()),
+         "exp": int((now + timedelta(seconds=kw.get("exp_delta", 180))).timestamp()),
+         "jti": str(uuid.uuid4()), "ret": ret}
+    return jwt.encode(p, PRIV, algorithm="RS256", headers={"kid": KID})
+
+def check_ret(label, got, want):
+    good = (got == want)
+    print(f"  {'OK ' if good else 'NG '} {label:<44} -> {got or '（空）'}")
+    return good
+
+CFG_RET = "https://example.invalid/user/funding/ai-agent/sso"
+results.append(check_ret("署名済みの ret が採用される",
+                         ret_of(make_ret("https://marugoto.example/sso")),
+                         "https://marugoto.example/sso"))
+results.append(check_ret("ret が無ければ設定値にフォールバック", ret_of(make()), CFG_RET))
+results.append(check_ret("http:// の ret は拒否して設定値に戻す",
+                         ret_of(make_ret("http://insecure.example/sso")), CFG_RET))
+results.append(check_ret("javascript: の ret は拒否",
+                         ret_of(make_ret("javascript:alert(1)")), CFG_RET))
+results.append(check_ret("期限切れでも署名済みの ret は取り出せる",
+                         ret_of(make_ret("https://lib.example/sso", exp_delta=-60)),
+                         "https://lib.example/sso"))
+
+# 未署名（改ざん）トークンの ret が使われないこと
+import base64 as _b64m, json as _jm
+_h = _b64m.urlsafe_b64encode(_jm.dumps({"alg":"RS256","typ":"JWT","kid":KID}).encode()).rstrip(b"=")
+_p = _b64m.urlsafe_b64encode(_jm.dumps({"iss":ISS,"aud":AUD,"sub":"C000000001",
+     "iat":int(datetime.now(tz=timezone.utc).timestamp()),
+     "exp":int((datetime.now(tz=timezone.utc)+timedelta(seconds=180)).timestamp()),
+     "jti":str(uuid.uuid4()),"ret":"https://phishing.example/steal"}).encode()).rstrip(b"=")
+tampered = (_h + b"." + _p + b".AAAA").decode()
+results.append(check_ret("署名が無効なトークンの ret は使わない",
+                         ret_of(tampered), CFG_RET))
 
 print()
 print(f"結果: {sum(results)} / {len(results)} 件が期待どおり")

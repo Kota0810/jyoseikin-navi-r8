@@ -76,30 +76,43 @@ def return_url() -> str:
     return str(_config().get("return_url", "") or "")
 
 
+def _safe_return_url(payload: dict) -> str:
+    """トークンに含まれる戻り先(ret)を取り出す。
+
+    ret は【署名検証済みのペイロードからのみ】取り出すこと。
+    未検証のトークンから読むと、任意のURLを仕込まれてフィッシングの
+    踏み台にされる。念のため https のみ許可する。
+    """
+    ret = str((payload or {}).get("ret", "") or "")
+    return ret if ret.startswith("https://") else ""
+
+
 def _verify(token: str):
     """署名とクレームを検証する。DBには触れない。
 
-    戻り値: (payload, None) または (None, 失敗理由)
+    戻り値: (payload, None, 戻り先) または (None, 失敗理由, 戻り先)
+    期限切れの場合でも署名自体は正しいため、署名検証だけ行って
+    戻り先を取り出す（利用者を発行側へ戻すために必要）。
     """
     keys = public_keys()
     cfg = _config()
     if not keys or not cfg.get("issuer") or not cfg.get("audience"):
-        return None, E_NOT_CONFIGURED
+        return None, E_NOT_CONFIGURED, ""
 
     try:
         import jwt
     except ImportError:
-        return None, E_NOT_CONFIGURED
+        return None, E_NOT_CONFIGURED, ""
 
     try:
         kid = jwt.get_unverified_header(token).get("kid")
     except Exception:
-        return None, E_BAD_TOKEN
+        return None, E_BAD_TOKEN, ""
 
     key = keys.get(str(kid))
     if not key:
         # 未知の kid。失効させた試験用鍵などがここに落ちる。
-        return None, E_BAD_TOKEN
+        return None, E_BAD_TOKEN, ""
 
     try:
         payload = jwt.decode(
@@ -112,19 +125,31 @@ def _verify(token: str):
             options={"require": ["exp", "iat", "jti", "sub", "iss", "aud"]},
         )
     except jwt.ExpiredSignatureError:
-        return None, E_EXPIRED
+        # 期限切れでも署名は正しい。戻り先を取り出すため、
+        # 署名・iss・aud は検証したうえで exp だけ無視して読み直す。
+        try:
+            expired = jwt.decode(
+                token, key, algorithms=ALLOWED_ALGORITHMS,
+                audience=cfg["audience"], issuer=cfg["issuer"],
+                options={"verify_exp": False},
+            )
+        except Exception:
+            expired = {}
+        return None, E_EXPIRED, _safe_return_url(expired)
     except Exception:
-        return None, E_BAD_TOKEN
+        return None, E_BAD_TOKEN, ""
 
     if not CUSTOMER_NO_RE.fullmatch(str(payload.get("sub", ""))):
-        return None, E_BAD_TOKEN
-    return payload, None
+        return None, E_BAD_TOKEN, _safe_return_url(payload)
+    return payload, None, _safe_return_url(payload)
 
 
 def authenticate(token: str):
     """トークンでログインできるか判定する。
 
-    戻り値: (user, None) または (None, 失敗理由)
+    戻り値: (user, 失敗理由, 戻り先URL)
+    戻り先URLは、トークンに ret が含まれていれば署名検証済みの値。
+    含まれていなければ設定値、それも無ければ空文字。
 
     検証の順序は発行側と合意済み。とくに jti の消費は
     「署名検証が通った時点」で行い、後続処理の成否とは切り離す。
@@ -132,25 +157,26 @@ def authenticate(token: str):
     弾いたトークンが再利用できないようにする。
     """
     # ① 署名・kid・iss・aud・exp
-    payload, err = _verify(token)
+    payload, err, ret = _verify(token)
+    ret = ret or return_url()          # ret が無ければ設定値にフォールバック
     if err:
-        return None, err
+        return None, err, ret
 
     # ② jti を消費（db 側で独立したトランザクションとしてコミットされる）
     exp_at = datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc)
     if not consume_jti(str(payload["jti"]), exp_at.strftime("%Y-%m-%d %H:%M:%S")):
-        return None, E_REPLAYED
+        return None, E_REPLAYED, ret
 
     # ③ 顧客番号でアカウントを検索
     user = get_user_by_customer_no(str(payload["sub"]))
     if not user:
-        return None, E_NO_ACCOUNT
+        return None, E_NO_ACCOUNT, ret
 
     # ④ 管理者・無効化アカウントは拒否する。
     #    管理者は全社の会話履歴を閲覧できるため、発行側が侵害された際の
     #    影響範囲を1社分に留める。運用で顧客番号を設定してしまっても
     #    ここで止まる。
     if user.get("is_admin") or not user.get("is_active"):
-        return None, E_NOT_ALLOWED
+        return None, E_NOT_ALLOWED, ret
 
-    return user, None
+    return user, None, ret

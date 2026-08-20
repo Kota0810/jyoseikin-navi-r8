@@ -1012,6 +1012,10 @@ footer, #MainMenu,
     font-size: .86rem; font-weight: 600; text-decoration: none;
 }
 .sso-back a:hover { background: #DDE5EF; }
+.sso-hint {
+    max-width: 34rem; margin: 0 auto 1.2rem !important; text-align: center;
+    color: #C7D5E6 !important; font-size: .84rem !important; line-height: 1.8 !important;
+}
 
 /* ログインフォームをカードとして見せる */
 [data-testid="stForm"] {
@@ -1227,6 +1231,7 @@ _defaults = {
     "input_key":           0,
     "last_error":          "",
     "sso_error":           "",
+    "sso_return_url":      "",
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -1243,7 +1248,7 @@ if not st.session_state.authenticated:
     if _sso_token:
         import sso as _sso
 
-        _sso_user, _sso_err = _sso.authenticate(_sso_token)
+        _sso_user, _sso_err, _sso_ret = _sso.authenticate(_sso_token)
         if _sso_user:
             st.session_state.authenticated = True
             st.session_state.user_id      = _sso_user["id"]
@@ -1253,6 +1258,7 @@ if not st.session_state.authenticated:
             st.session_state.sso_error    = ""
         else:
             st.session_state.sso_error = _sso_err
+            st.session_state.sso_return_url = _sso_ret
         # トークンをURLから消す。ブラウザ履歴や再読み込みで再送されないようにする。
         st.query_params.clear()
         st.rerun()
@@ -1318,16 +1324,27 @@ if st.session_state.app_state == "login":
             f"<div class='sso-notice'>{html.escape(_msg)}</div>", unsafe_allow_html=True
         )
 
-        # 再試行で解決する種類の失敗にだけ、発行側へ戻る導線を出す。
-        # 契約が無い場合に戻しても同じ結果になるため出さない。
-        _back = _sso.return_url()
-        if _back and st.session_state.sso_error in (_sso.E_EXPIRED, _sso.E_REPLAYED):
-            st.markdown(
-                f"<div class='sso-back'><a href='{html.escape(_back)}' target='_self'>"
-                "もう一度ログインする</a></div>",
-                unsafe_allow_html=True,
-            )
+        # 再試行で解決する種類の失敗にだけ、やり直しの導線を出す。
+        # 契約が無い場合は戻しても同じ結果になるため出さない。
+        if st.session_state.sso_error in (_sso.E_EXPIRED, _sso.E_REPLAYED):
+            _back = st.session_state.sso_return_url
+            if _back:
+                # 署名済みの戻り先が分かっている場合はボタンで戻す。
+                st.markdown(
+                    f"<div class='sso-back'><a href='{html.escape(_back)}' target='_self'>"
+                    "もう一度ログインする</a></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                # 戻り先が分からない場合は、元のタブへ戻ってもらう。
+                # 発行側は新しいタブで開くため、元のタブは残っている。
+                st.markdown(
+                    "<p class='sso-hint'>元のタブに戻り、もう一度"
+                    "「AIエージェント」を押してください。</p>",
+                    unsafe_allow_html=True,
+                )
         st.session_state.sso_error = ""
+        st.session_state.sso_return_url = ""
 
     col_l, col_c, col_r = st.columns([1, 2, 1])
     with col_c:
