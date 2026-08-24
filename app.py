@@ -1241,11 +1241,17 @@ for k, v in _defaults.items():
 # =============================================================
 # SSO（他システムからの署名付きトークンによるログイン）
 # =============================================================
-# 未ログインのときだけ処理する。ログイン成立後は再実行されても
+# トークンを処理するのは未ログインのときだけ。ログイン成立後に再実行されても
 # ここを通らないため、同じトークンが二重に処理されることはない。
-if not st.session_state.authenticated:
-    _sso_token = st.query_params.get("t")
-    if _sso_token:
+#
+# ただし【URLからの除去は認証状態に関わらず必ず行う】。
+# 処理をスキップしたときに消し忘れると、トークンがURLに残ったままになり、
+# ブラウザの戻る操作で何度もその状態に戻れてしまう。さらにその状態で
+# ログアウトすると、残ったトークンが再処理されて「既に使用済みです」と
+# 表示され、通常のログイン画面に戻れなくなる。
+_sso_token = st.query_params.get("t")
+if _sso_token:
+    if not st.session_state.authenticated:
         import sso as _sso
 
         _sso_user, _sso_err, _sso_ret = _sso.authenticate(_sso_token)
@@ -1259,9 +1265,8 @@ if not st.session_state.authenticated:
         else:
             st.session_state.sso_error = _sso_err
             st.session_state.sso_return_url = _sso_ret
-        # トークンをURLから消す。ブラウザ履歴や再読み込みで再送されないようにする。
-        st.query_params.clear()
-        st.rerun()
+    st.query_params.clear()
+    st.rerun()
 
 
 # =============================================================
