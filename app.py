@@ -442,6 +442,62 @@ def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases
 # =============================================================
 # 添削用システムプロンプト構築
 # =============================================================
+# ナレッジを JSON のまま渡すと、AI が根拠を示すときにレコードを
+# そのまま貼り付け、レポートに category / term / definition などの
+# 英語キー名が現れる。キー名自体を見せないよう、渡す前に日本語の
+# 箇条書きへ整形する。
+#
+# header_recipient のような英単語だけの item_id を持つドメインがある。
+# 見出しに出すとレポートにそのまま英語が現れるので伏せる。ただし
+# 「第1条」「1-⑥」「③(1)」「3-4」のような番号・記号のIDは、書類上の
+# どこを指すかを示す手がかりなので残す（英語の原因にもならない）。
+_SLUG_ID_RE = re.compile(r"^(?=[A-Za-z0-9_.\-]+$).*[A-Za-z]")
+
+
+def _form_items_to_text(items: list) -> str:
+    # 同じ label が複数ある様式（申請者の電話番号／代理人の電話番号など）では
+    # ID を伏せると区別がつかなくなる。重複する label には必ずIDを添える。
+    labels = [str(it.get("label", "")).strip() for it in items]
+    dup = {l for l in labels if l and labels.count(l) > 1}
+
+    lines = []
+    for it in items:
+        item_id = str(it.get("item_id", "")).strip()
+        label   = str(it.get("label", "")).strip()
+        if label and item_id and _SLUG_ID_RE.match(item_id) and label not in dup:
+            head = label
+        else:
+            head = " ".join(x for x in (item_id, label) if x)
+        lines.append(f"■ {head or '（項目名なし）'}")
+        if it.get("instruction"):
+            lines.append(f"  記入の考え方: {it['instruction']}")
+        if it.get("logic_check"):
+            lines.append(f"  確認すべき点: {it['logic_check']}")
+        lines.append("")
+    return "\n".join(lines).rstrip() or "（様式基準なし）"
+
+
+def _rules_to_text(rules: list) -> str:
+    # domain は選択中のドメインで固定なので落とす。applies_to（支給申請・
+    # 計画届など）は、様式と段階の対応表が未定義のドメインでは絞り込みが
+    # 効かず全件が渡るため、落とすとルールの適用場面が判断できなくなる。
+    lines = []
+    for r in rules:
+        term = str(r.get("term", "")).strip() or "（項目名なし）"
+        lines.append(f"■ {term}")
+        if r.get("category"):
+            lines.append(f"  分類: {r['category']}")
+        if r.get("definition"):
+            lines.append(f"  内容: {r['definition']}")
+        applies = [str(a) for a in (r.get("applies_to") or []) if str(a).strip()]
+        if applies:
+            lines.append(f"  適用場面: {'、'.join(applies)}")
+        if r.get("source"):
+            lines.append(f"  出典: {r['source']}")
+        lines.append("")
+    return "\n".join(lines).rstrip() or "（ルール基準なし）"
+
+
 def build_review_prompt(selected_form, form_map, rules_and_cases):
     form_items = form_map.get(selected_form, {}).get("items", [])
     today = date.today()
@@ -455,18 +511,30 @@ def build_review_prompt(selected_form, form_map, rules_and_cases):
 ※ 日付の過去・未来の判定は必ず上記の本日の日付を基準にしてください。
 
 【添削手順】
-STEP1: 書類の各項目を識別し、【様式基準】のitem_idと照合する。
-STEP2: 各記載内容が様式基準の instruction に沿っているか確認する。
+STEP1: 書類の各項目を識別し、【様式基準】の該当する項目と照合する。
+STEP2: 各記載内容が、その項目の「記入の考え方」に沿っているか確認する。
 STEP3: 数値・日付・計算値が【ルール基準】と矛盾していないか確認する。
 STEP4: 結果を ⚠️要修正 / 💡改善提案 / ✅問題なし の3段階で報告。
 
+【出力形式】
+・書類に記載されている順に、項目ごとの見出しを立てて報告すること。
+・各項目について、次の3点だけを日本語の文章で書くこと。
+
+    評価: ⚠️要修正 / 💡改善提案 / ✅問題なし のいずれか
+    理由: なぜそう判断したかを、根拠となる基準の内容に触れながら説明する
+    修正案: 要修正・改善提案の場合のみ、書き換え後の文面をそのまま示す
+
+・すべて日本語で書くこと。
+・【様式基準】【ルール基準】の記載をそのまま貼り付けてはならない。
+  波括弧・角括弧・引用符を使ったデータ形式や、英字の項目名を
+  レポートに出してはならない。根拠は必ず自分の言葉で日本語に言い換えること。
+・基準の出典を示す場合は、資料名のみを「（出典: ○○.pdf）」の形で添えること。
+
 【様式基準】（{selected_form}）
-{json.dumps(form_items, ensure_ascii=False, indent=2)}
+{_form_items_to_text(form_items)}
 
 【ルール基準】（支給要領）
-{json.dumps(rules_and_cases, ensure_ascii=False)}
-
-添削レポートは日本語で、項目ごとに箇条書きでまとめてください。
+{_rules_to_text(rules_and_cases)}
 """
 
 
