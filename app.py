@@ -1253,6 +1253,41 @@ footer, #MainMenu,
     background: transparent !important; border-color: var(--sb-line) !important; color: var(--sb-fg) !important;
 }
 
+/* 添削中の表示。
+   既定のスピナーは濃紺サイドバーの奥で小さく回るだけで、処理が進んでいるのか
+   固まったのか分からない。添削は書類の量によっては1分近くかかるので、
+   画面の中央に出して手を止めてよいことが分かるようにする。 */
+.busy-veil {
+    /* サイドバー(999991)・ヘッダー(999990)より上に出す */
+    position: fixed; inset: 0; z-index: 999999;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(18,22,29,.58);
+    backdrop-filter: blur(2px);
+}
+.busy-card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: 0 18px 48px -18px rgba(18,22,29,.55);
+    padding: 26px 34px; text-align: center; min-width: 264px;
+}
+.busy-dots { display: flex; gap: 7px; justify-content: center; margin-bottom: 14px; }
+.busy-dots i {
+    display: block; width: 9px; height: 9px; border-radius: 50%;
+    background: var(--navy);
+    animation: busy-bounce 1.05s infinite ease-in-out both;
+}
+.busy-dots i:nth-child(2) { animation-delay: .14s; }
+.busy-dots i:nth-child(3) { animation-delay: .28s; }
+@keyframes busy-bounce {
+    0%, 80%, 100% { transform: scale(.55); opacity: .45; }
+    40%           { transform: scale(1);   opacity: 1; }
+}
+.busy-title { font-size: 1.02rem; font-weight: 700; color: var(--ink); }
+.busy-sub { margin-top: 7px; font-size: .82rem; color: var(--ink-muted); line-height: 1.75; }
+@media (prefers-reduced-motion: reduce) {
+    .busy-dots i { animation: none; opacity: .85; }
+}
+
 [data-testid="stAlertContainer"] {
     border-radius: var(--radius) !important; border: 1px solid var(--line) !important;
     box-shadow: none !important; font-size: .82rem;
@@ -1570,6 +1605,12 @@ elif st.session_state.app_state == "setup":
 elif st.session_state.app_state == "chat":
     require_login()
 
+    # 添削中の表示を出すための置き場。
+    # ★ 本文側に作ること。サイドバーの中に作ると、サイドバーに transform が
+    #   掛かっているため position: fixed がサイドバー基準になり、画面全体を
+    #   覆えない（幅0になる）。書き込むのはサイドバーの中からで構わない。
+    busy_slot = st.empty()
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 左サイドバー（新規チャット・添削モード・様式表示）
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1597,11 +1638,22 @@ elif st.session_state.app_state == "chat":
             if uploaded_file:
                 st.caption(uploaded_file.name)
                 if st.button("添削を実行", type="primary", use_container_width=True, key="review_run"):
-                    with st.spinner("添削中..."):
-                        st.session_state.review_result = review_document(
-                            uploaded_file, st.session_state.selected_form,
-                            form_map, rules_and_cases,
-                        )
+                    # 待ち時間が長いので、サイドバーのスピナーではなく
+                    # 画面全体に出す。書き出しは処理を始める前に送る。
+                    busy_slot.markdown(
+                        "<div class='busy-veil'><div class='busy-card'>"
+                        "<div class='busy-dots'><i></i><i></i><i></i></div>"
+                        "<div class='busy-title'>添削しています</div>"
+                        "<div class='busy-sub'>書類の量によっては1分ほどかかります。<br>"
+                        "このまま開いたままお待ちください。</div>"
+                        "</div></div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.session_state.review_result = review_document(
+                        uploaded_file, st.session_state.selected_form,
+                        form_map, rules_and_cases,
+                    )
+                    busy_slot.empty()
                     st.rerun()
 
         # ── 制度の選択画面に戻る（確認ダイアログ付き） ──
