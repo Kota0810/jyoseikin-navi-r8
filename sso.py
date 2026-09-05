@@ -20,6 +20,7 @@ sso.py  –  他システムからの署名付きトークン（JWT）による�
     -----END PUBLIC KEY-----'''
 """
 import os
+import sys
 import re
 from datetime import datetime, timezone
 
@@ -87,32 +88,52 @@ def _safe_return_url(payload: dict) -> str:
     return ret if ret.startswith("https://") else ""
 
 
+def _log(outcome: str, info: dict, detail: str = "") -> None:
+    """判定結果を1行だけ標準エラーへ出す（Streamlit Cloud のログで読める）。
+
+    ★ 顧客番号(sub)とトークン本体は絶対に出さないこと。
+      このログは運用画面から読めるため、どの会社がいつ入ったかが
+      残ってしまう。切り分けに要るのは kid と jti だけで、
+      どちらも秘密ではなく、発行側との突き合わせにも使える。
+
+    画面には「ログインできませんでした」としか出さない方針のため、
+    弾いた本当の理由はここにしか残らない。detail には
+    bad_token の内訳（鍵が無い／署名が違う 等）まで書く。
+    """
+    d = f" detail={detail}" if detail else ""
+    print(f"[sso] {outcome} kid={info.get('kid') or '-'} "
+          f"jti={info.get('jti') or '-'}{d}", file=sys.stderr, flush=True)
+
+
 def _verify(token: str):
     """署名とクレームを検証する。DBには触れない。
 
-    戻り値: (payload, None, 戻り先) または (None, 失敗理由, 戻り先)
+    戻り値: (payload, 失敗理由, 戻り先, info, detail)
+    info は記録用の {kid, jti}。detail は失敗理由の内訳（記録用）。
     期限切れの場合でも署名自体は正しいため、署名検証だけ行って
     戻り先を取り出す（利用者を発行側へ戻すために必要）。
     """
+    info = {"kid": None, "jti": None}
     keys = public_keys()
     cfg = _config()
     if not keys or not cfg.get("issuer") or not cfg.get("audience"):
-        return None, E_NOT_CONFIGURED, ""
+        return None, E_NOT_CONFIGURED, "", info, "no_public_key_or_issuer"
 
     try:
         import jwt
     except ImportError:
-        return None, E_NOT_CONFIGURED, ""
+        return None, E_NOT_CONFIGURED, "", info, "pyjwt_missing"
 
     try:
         kid = jwt.get_unverified_header(token).get("kid")
     except Exception:
-        return None, E_BAD_TOKEN, ""
+        return None, E_BAD_TOKEN, "", info, "header_unreadable"
+    info["kid"] = str(kid) if kid else None
 
     key = keys.get(str(kid))
     if not key:
-        # 未知の kid。失効させた試験用鍵などがここに落ちる。
-        return None, E_BAD_TOKEN, ""
+        # 未知の kid。失効させた試験用鍵や、対応表への登録漏れがここに落ちる。
+        return None, E_BAD_TOKEN, "", info, "unknown_kid"
 
     try:
         payload = jwt.decode(
@@ -135,13 +156,17 @@ def _verify(token: str):
             )
         except Exception:
             expired = {}
-        return None, E_EXPIRED, _safe_return_url(expired)
-    except Exception:
-        return None, E_BAD_TOKEN, ""
+        info["jti"] = str(expired.get("jti", "")) or None
+        return None, E_EXPIRED, _safe_return_url(expired), info, ""
+    except Exception as e:
+        # 署名違い・iss/aud 違い・必須クレーム欠けが、画面上は同じ文言になる。
+        # どれだったかはここでしか分からないので型名だけ残す。
+        return None, E_BAD_TOKEN, "", info, type(e).__name__
 
+    info["jti"] = str(payload.get("jti", "")) or None
     if not CUSTOMER_NO_RE.fullmatch(str(payload.get("sub", ""))):
-        return None, E_BAD_TOKEN, _safe_return_url(payload)
-    return payload, None, _safe_return_url(payload)
+        return None, E_BAD_TOKEN, _safe_return_url(payload), info, "sub_format"
+    return payload, None, _safe_return_url(payload), info, ""
 
 
 def authenticate(token: str):
@@ -157,19 +182,22 @@ def authenticate(token: str):
     弾いたトークンが再利用できないようにする。
     """
     # ① 署名・kid・iss・aud・exp
-    payload, err, ret = _verify(token)
+    payload, err, ret, info, detail = _verify(token)
     ret = ret or return_url()          # ret が無ければ設定値にフォールバック
     if err:
+        _log("deny:" + err, info, detail)
         return None, err, ret
 
     # ② jti を消費（db 側で独立したトランザクションとしてコミットされる）
     exp_at = datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc)
     if not consume_jti(str(payload["jti"]), exp_at.strftime("%Y-%m-%d %H:%M:%S")):
+        _log("deny:" + E_REPLAYED, info)
         return None, E_REPLAYED, ret
 
     # ③ 顧客番号でアカウントを検索
     user = get_user_by_customer_no(str(payload["sub"]))
     if not user:
+        _log("deny:" + E_NO_ACCOUNT, info)
         return None, E_NO_ACCOUNT, ret
 
     # ④ 管理者・無効化アカウントは拒否する。
@@ -177,6 +205,9 @@ def authenticate(token: str):
     #    影響範囲を1社分に留める。運用で顧客番号を設定してしまっても
     #    ここで止まる。
     if user.get("is_admin") or not user.get("is_active"):
+        _log("deny:" + E_NOT_ALLOWED, info,
+             "admin" if user.get("is_admin") else "inactive")
         return None, E_NOT_ALLOWED, ret
 
+    _log("ok", info)
     return user, None, ret
