@@ -265,12 +265,22 @@ _init_db(SCHEMA_VERSION)
 # データロード
 # =============================================================
 def _domain_mtime(domain_key: str) -> str:
-    """form_structures.json の更新時刻を返す（キャッシュ無効化用）"""
+    """ドメインの知識JSONの更新時刻を返す（キャッシュ無効化用）。
+
+    domain_config.json も見ること。コース区分を入れてから、この
+    ファイルは表示名だけでなく「どの様式・どの資料をそのコースで
+    使うか」を決めるようになった。form_structures.json だけを見て
+    いると、コースを直しても画面に反映されない。
+    """
     base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "domains", domain_key)
-    try:
-        return str(int(os.path.getmtime(os.path.join(base_dir, "form_structures.json"))))
-    except Exception:
-        return "0"
+    stamps = []
+    for name in ("form_structures.json", "domain_config.json",
+                 "basic_rules.json", "pdf_chunks.json"):
+        try:
+            stamps.append(int(os.path.getmtime(os.path.join(base_dir, name))))
+        except Exception:
+            pass
+    return str(max(stamps)) if stamps else "0"
 
 
 @st.cache_data
@@ -303,6 +313,24 @@ def _domain_sort_key(entry: str):
     if entry in DOMAIN_DISPLAY_ORDER:
         return (0, DOMAIN_DISPLAY_ORDER.index(entry), "")
     return (1, 0, entry)
+
+
+def _restore_course(conv: dict) -> None:
+    """保存済みの会話を開くとき、コースの選択も元に戻す。
+
+    course 列が空（コース区分の無い制度、または列を足す前の古い会話）なら
+    何もしない。その場合は制度全体が対象になり、これまでと同じ挙動になる。
+    """
+    key = (conv or {}).get("course") or ""
+    st.session_state.selected_course = key
+    if not key:
+        st.session_state.selected_course_name = ""
+        return
+    try:
+        _, _, _, cfg = load_knowledge(conv["domain_key"], mtime=_domain_mtime(conv["domain_key"]))
+        st.session_state.selected_course_name = find_course(cfg, key).get("name", key)
+    except Exception:
+        st.session_state.selected_course_name = key
 
 
 def scan_domains() -> dict:
@@ -366,6 +394,64 @@ def filter_rules_by_stage(rules: list, stage: str) -> list:
         or "全般" in r.get("applies_to", [])
         or stage in r.get("applies_to", [])
     ]
+
+
+# =============================================================
+# コース（制度の下の区分）
+# =============================================================
+# 助成金によっては、ひとつの制度の下にコースが並び、様式も支給要領も別になる。
+# 例: 人材開発支援助成金 ＝ 人材育成支援コース / 建設労働者技能実習コース / …
+# 分けずに全部見せると、別コースの様式や要領が混ざって回答が濁るため、
+# domain_config.json に courses があるドメインだけ、選択を1段深くする。
+# courses が無いドメイン（業務改善助成金など）はこれまでどおり2段のまま。
+def domain_courses(cfg: dict) -> list:
+    return cfg.get("courses") or []
+
+
+def find_course(cfg: dict, course_key: str) -> dict:
+    return next((c for c in domain_courses(cfg) if c.get("key") == course_key), {})
+
+
+def filter_forms_by_course(form_map: dict, cfg: dict, course_key: str) -> dict:
+    """そのコースで使う様式だけに絞る。コース未指定・未設定なら素通し。"""
+    course = find_course(cfg, course_key)
+    want = set(course.get("forms") or [])
+    if not want:
+        return form_map
+    return {k: v for k, v in form_map.items() if k in want}
+
+
+def excluded_sources(cfg: dict, course_key: str) -> set:
+    """このコースでは見せない資料（＝他コース専用の資料）の出典名の集合。
+
+    「このコースの資料だけ残す」ではなく「他コースの資料だけ落とす」に
+    している。どのコースにも割り当てていない資料——制度共通の手引き、
+    共通Q&A、パンフレット、それに知識抽出のときに出典名が崩れた
+    レコード——を取りこぼさないため。コース側に sources を1つも
+    書いていない制度（様式だけコース分けする制度）では空集合を返し、
+    知識は一切絞らない。
+    """
+    courses = domain_courses(cfg)
+    if not any(c.get("sources") for c in courses):
+        return set()
+    # 選ばれているコースがこの制度のものでないときは何も絞らない。
+    # ここで素通しにしておかないと「自分のぶんは無い・他コースのぶんは
+    # 全部除外」となり、資料が丸ごと消える。
+    if not find_course(cfg, course_key):
+        return set()
+    own = set(find_course(cfg, course_key).get("sources") or [])
+    others = set()
+    for c in courses:
+        if c.get("key") != course_key:
+            others |= set(c.get("sources") or [])
+    return others - own
+
+
+def drop_sources(records: list, exclude: set) -> list:
+    """他コース専用の資料から作ったルール・チャンクを外す。"""
+    if not exclude:
+        return records
+    return [r for r in records if r.get("source") not in exclude]
 
 
 # =============================================================
@@ -1314,6 +1400,15 @@ if _domain_key:
 else:
     form_map, rules_and_cases, pdf_chunks, domain_config = {}, [], [], {}
 
+# コースが選ばれていれば、様式も知識もそのコースのぶんだけに絞る。
+# ここで絞っておけば、以降の質問・添削・右カラムはすべて自動的にコース単位になる。
+_course_key = st.session_state.get("selected_course", "")
+if _domain_key and _course_key:
+    _drop           = excluded_sources(domain_config, _course_key)
+    form_map        = filter_forms_by_course(form_map, domain_config, _course_key)
+    rules_and_cases = drop_sources(rules_and_cases, _drop)
+    pdf_chunks      = drop_sources(pdf_chunks, _drop)
+
 # ── セッション初期化 ──────────────────────────────────────────
 _defaults = {
     # 認証
@@ -1327,6 +1422,8 @@ _defaults = {
     "messages":            [],
     "selected_domain_key": "",
     "selected_grant":      "",
+    "selected_course":     "",   # コース区分のある制度だけ使う（無い制度は空）
+    "selected_course_name": "",
     "selected_form":       "",
     "review_result":       "",
     "pending_item":        None,
@@ -1508,6 +1605,7 @@ elif st.session_state.app_state == "setup":
                     st.session_state.selected_form   = _conv["form_name"]
                     _avail = scan_domains()
                     st.session_state.selected_grant  = _avail.get(_conv["domain_key"], _conv["domain_key"])
+                    _restore_course(_conv)
                     st.session_state.app_state       = "chat"
                     st.session_state.review_result   = ""
                     st.session_state.pending_item    = None
@@ -1547,9 +1645,41 @@ elif st.session_state.app_state == "setup":
         # 選択ドメインの様式一覧を取得（form_structures.json が更新されると自動的にキャッシュ再読込）
         _fm, _, _, _sel_cfg = load_knowledge(_sel_domain_key, mtime=_domain_mtime(_sel_domain_key))
 
+        # ── コース選択（コース区分のある制度だけ挟む）──
+        # 制度を選んだ時点では、その制度の全コースの様式が混ざっている。
+        # ここで絞らないと、たとえば人材開発支援助成金で教育訓練休暇の様式と
+        # 人材育成支援コースの様式が同じ一覧に並んでしまう。
+        _courses      = domain_courses(_sel_cfg)
+        _sel_course   = ""
+        _sel_course_nm = ""
+        _step = 2
+        if _courses:
+            st.markdown(
+                "<div class='form-sep'></div>"
+                f"<div class='step-head'><span class='step-num'>STEP {_step}</span>"
+                "<span class='step-title'>コースを選択</span></div>",
+                unsafe_allow_html=True,
+            )
+            _course_keys   = [c.get("key", "") for c in _courses]
+            _course_labels = [c.get("name", c.get("key", "")) for c in _courses]
+            _prev_course   = st.session_state.get("selected_course", "")
+            _c_idx = _course_keys.index(_prev_course) if _prev_course in _course_keys else 0
+            _c_sel = st.selectbox(
+                "コース",
+                range(len(_course_keys)),
+                format_func=lambda i: _course_labels[i],
+                index=_c_idx,
+                label_visibility="collapsed",
+            )
+            _sel_course    = _course_keys[_c_sel]
+            _sel_course_nm = _course_labels[_c_sel]
+            # 選んだコースの様式だけに絞ってから STEP 3 に渡す
+            _fm = filter_forms_by_course(_fm, _sel_cfg, _sel_course)
+            _step = 3
+
         st.markdown(
             "<div class='form-sep'></div>"
-            "<div class='step-head'><span class='step-num'>STEP 2</span>"
+            f"<div class='step-head'><span class='step-num'>STEP {_step}</span>"
             "<span class='step-title'>相談・添削したい様式を選択</span></div>",
             unsafe_allow_html=True,
         )
@@ -1576,22 +1706,26 @@ elif st.session_state.app_state == "setup":
         _start = st.button("相談を開始する", use_container_width=True, type="primary", key="setup_start")
 
     if _start:
-        # タイトルを「制度名/様式名」形式で設定（様式未指定の場合は制度名のみ）
-        _conv_title = (
-            f"{_sel_domain_label}/{selected_form}"
-            if selected_form != "全般（様式を特定しない）"
-            else _sel_domain_label
-        )
+        # タイトルは「制度名／コース名／様式名」。コースも様式も無ければ制度名だけ。
+        _title_parts = [_sel_domain_label]
+        if _sel_course_nm:
+            _title_parts.append(_sel_course_nm)
+        if selected_form != "全般（様式を特定しない）":
+            _title_parts.append(selected_form)
+        _conv_title = "/".join(_title_parts)
         # DB に新規スレッドを作成
         conv_id = create_conversation(
             st.session_state.user_id,
             _sel_domain_key,
             selected_form,
             title=_conv_title,
+            course=_sel_course,
         )
         st.session_state.app_state           = "chat"
         st.session_state.selected_domain_key = _sel_domain_key
         st.session_state.selected_grant      = _sel_domain_label
+        st.session_state.selected_course     = _sel_course
+        st.session_state.selected_course_name = _sel_course_nm
         st.session_state.selected_form       = selected_form
         st.session_state.current_conv_id     = conv_id
         st.session_state.messages            = []
@@ -1696,6 +1830,7 @@ elif st.session_state.app_state == "chat":
                 # domain_key から表示名を復元
                 _avail = scan_domains()
                 st.session_state.selected_grant  = _avail.get(_conv["domain_key"], _conv["domain_key"])
+                _restore_course(_conv)
                 st.session_state.app_state       = "chat"
                 st.session_state.review_result   = ""
                 st.session_state.pending_item    = None
@@ -1728,6 +1863,11 @@ elif st.session_state.app_state == "chat":
             + f"<h2 class='ctx-title'>{html.escape(_form_name)}</h2>"
             + "<div class='ctx-meta'>"
             + f"<span class='ctx-domain'>{html.escape(st.session_state.selected_grant)}</span>"
+            # コースまで絞っている場合は、いまどのコースを見ているかを常に出す。
+            # 制度名だけだと、別コースの内容だと思い込んだまま進む恐れがある。
+            + (f"<span class='ctx-sep'></span>"
+               f"<span class='ctx-domain'>{html.escape(st.session_state.selected_course_name)}</span>"
+               if st.session_state.get("selected_course_name") else "")
             + f"<span class='ctx-sep'></span><span>{DISCLAIMER_TEXT}</span>"
             + "</div></div>",
             unsafe_allow_html=True,

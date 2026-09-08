@@ -79,7 +79,7 @@ def get_conn():
 # キャッシュはデコレートした関数自身のコードでしか無効化されないため、
 # ここのスキーマだけ変えてもプロセスが生き残っているとマイグレーションが
 # 実行されない。スキーマを変更したら必ずこの値を +1 すること。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def create_tables():
@@ -127,6 +127,11 @@ def create_tables():
             cur.execute("""
                 ALTER TABLE conversations
                 ADD COLUMN IF NOT EXISTS app_year TEXT NOT NULL DEFAULT 'R7'
+            """)
+            # コース区分。制度の下にコースがある助成金だけ入る（無い制度は空のまま）。
+            cur.execute("""
+                ALTER TABLE conversations
+                ADD COLUMN IF NOT EXISTS course TEXT NOT NULL DEFAULT ''
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_user     ON conversations(user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_conv_updated  ON conversations(updated_at)")
@@ -380,14 +385,16 @@ def get_all_user_stats() -> list[dict]:
 # =============================================================
 # 会話スレッド関連
 # =============================================================
-def create_conversation(user_id: int, domain_key: str, form_name: str, title: str = "無題の会話") -> int:
+def create_conversation(user_id: int, domain_key: str, form_name: str,
+                        title: str = "無題の会話", course: str = "") -> int:
     now = _now()
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO conversations (user_id, domain_key, form_name, title, created_at, updated_at, app_year)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-                (user_id, domain_key, form_name, title, now, now, APP_YEAR),
+                """INSERT INTO conversations
+                       (user_id, domain_key, form_name, course, title, created_at, updated_at, app_year)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (user_id, domain_key, form_name, course, title, now, now, APP_YEAR),
             )
             return cur.fetchone()["id"]
 
