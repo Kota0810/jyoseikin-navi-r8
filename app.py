@@ -1494,6 +1494,23 @@ if st.session_state.app_state == "login":
         .brand-disclaimer { color: #A9B6C7 !important; }
         .year-badge { background: rgba(255,255,255,.13) !important; color: #C7D5E6 !important; }
         [data-testid="stForm"] { box-shadow: 0 18px 48px rgba(0,0,0,.22) !important; border-color: transparent !important; }
+
+        /* ログイン失敗の表示。
+           既定のアラートは淡い下地に載せる前提の配色なので、
+           ここだけ全面が濃紺だと地に沈んで、何が書いてあるか読めない。
+           カードと同じ白い面に赤い縦線を立てて、本文は濃い赤にする。 */
+        [data-testid="stAlertContainer"] {
+            background: #FFFFFF !important;
+            border: 1px solid #E7C3C5 !important;
+            border-left: 5px solid var(--danger) !important;
+            color: var(--danger) !important;
+            font-size: .88rem !important;
+            font-weight: 600;
+            box-shadow: 0 10px 26px -14px rgba(0,0,0,.4) !important;
+        }
+        [data-testid="stAlertContainer"] * { color: var(--danger) !important; }
+        /* 既定のアイコンは淡くて見えないので、色を合わせる */
+        [data-testid="stAlertContainer"] svg { fill: var(--danger) !important; }
         </style>
         """,
         unsafe_allow_html=True,
