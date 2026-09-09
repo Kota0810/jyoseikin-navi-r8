@@ -1422,6 +1422,14 @@ footer, #MainMenu,
 }
 [data-testid="stSidebar"] [data-testid="stExpander"] summary svg { fill: #FFFFFF !important; color: #FFFFFF !important; }
 [data-testid="stSidebar"] [data-testid="stExpander"]:hover { background: rgba(255,255,255,.12) !important; }
+/* 添削パネルの注意書き。濃紺の上なので、本文色のままだと沈む。 */
+.upload-note {
+    color: #C7D5E6 !important; font-size: .74rem; line-height: 1.65;
+    margin: 2px 0 10px; padding: 9px 11px;
+    background: rgba(255,255,255,.06); border-left: 3px solid #7FA9DC;
+    border-radius: 6px;
+}
+.upload-note b { color: #FFFFFF !important; }
 [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {
     background: rgba(255,255,255,.05) !important; border-color: var(--sb-line) !important;
 }
@@ -1874,6 +1882,13 @@ elif st.session_state.app_state == "chat":
         # ── 添削モード ──
         with st.expander("添削モード"):
             st.caption("申請書類をアップロードして添削します。")
+            # ○やチェックは Word だと図形として入っていて文字にならないため、
+            # 添削では読み取れない。PDF は書類そのものをAIに渡すので読める。
+            # 上げる前に気づけるよう、ここに出しておく。
+            st.markdown(
+                "<p class='upload-note'><b>PDFを推奨します。</b>○やチェックを付けた欄は、Word・Excelのままだと読み取れません（印が文字ではなく図形として入っているため）。Word で「PDFとして保存」してからアップロードすると、印まで見て添削できます。</p>",
+                unsafe_allow_html=True,
+            )
             uploaded_file = st.file_uploader(
                 "申請書類", type=["pdf", "docx", "xlsx", "xls", "xlsm", "csv"], label_visibility="collapsed",
             )
