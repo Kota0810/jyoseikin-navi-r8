@@ -648,6 +648,57 @@ STEP4: 結果を ⚠️要修正 / 💡改善提案 / ✅問題なし の3段階
 
 
 # =============================================================
+# Word 文書の本文取り出し
+# =============================================================
+def docx_to_text(doc) -> str:
+    """本文を、書かれている順に取り出す。
+
+    ★ doc.paragraphs は表の中の段落を含まない。
+      申請様式は記入欄がほぼ全部表の中にあるため、段落だけを渡すと
+      表紙と注意書きしか見えない。実測で、雇用管理制度等整備計画書は
+      全体の 12% しか渡っていなかった。
+
+    表はセルを「｜」で区切った1行にする。行と列の関係が保たれ、
+    どの見出しの欄に何が書いてあるかが読み取れる。
+    """
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    out = []
+    for child in doc.element.body.iterchildren():
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            t = Paragraph(child, doc).text.strip()
+            if t:
+                out.append(t)
+        elif tag == "tbl":
+            for row in Table(child, doc).rows:
+                cells = []
+                for c in row.cells:
+                    v = " ".join(x.text.strip() for x in c.paragraphs if x.text.strip())
+                    cells.append(v)
+                # 結合セルは同じ内容が繰り返し返るので、重複を落として1行にする
+                if any(cells):
+                    out.append(" ｜ ".join(dict.fromkeys(cells)))
+    return "\n".join(out)
+
+
+def count_docx_shapes(raw: bytes) -> int:
+    """図形（○印・矢印など）の数を数える。
+
+    python-docx は図形を扱えないので、docx の中身（XML）を直接見る。
+    手で付けた○は v:oval、Word の図形は wps:wsp として入っている。
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "ignore")
+    except Exception:
+        return 0
+    return xml.count("<v:oval") + xml.count("<v:shape") + xml.count("<wps:wsp")
+
+
+# =============================================================
 # ファイル添削処理（PDF / DOCX / XLSX）
 # =============================================================
 def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
@@ -679,13 +730,30 @@ def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
     elif file_name.endswith(".docx"):
         try:
             from docx import Document
-            doc  = Document(io.BytesIO(uploaded_file.read()))
-            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
         except ImportError:
             return "❌ `pip install python-docx` が必要です。"
+        raw  = uploaded_file.read()
+        doc  = Document(io.BytesIO(raw))
+        text = docx_to_text(doc)
+        # 図形（○印など）は文字として取り出せない。あることだけ伝え、
+        # 位置の判定はさせない。黙っていると当て推量で「○が付いている」と
+        # 書いてしまう。
+        shapes = count_docx_shapes(raw)
+        notice = ""
+        if shapes:
+            notice = (
+                f"\n\n【この文書の読み取りについて】\n"
+                f"この Word 文書には、文字ではない図形が {shapes} 個あります。"
+                "様式の選択肢に手で付けた○印は、この図形であることがほとんどです。"
+                "図形は文字として取り出せないため、下の本文には含まれていません。\n"
+                "・どの選択肢に○が付いているかは判定できません。推測で「○が付いている」"
+                "「選択済み」と書かないでください。\n"
+                "・選択欄については『○印は文字として読み取れないため確認できません。"
+                "PDF形式で保存し直して添削すると判定できます』と書いてください。\n"
+            )
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=f"以下のWord文書を添削してください：\n\n{text}",
+            contents=f"以下のWord文書を添削してください：{notice}\n\n{text}",
             config=types.GenerateContentConfig(system_instruction=review_sys),
         )
         return response.text
