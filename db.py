@@ -3,6 +3,7 @@ db.py  –  PostgreSQL CRUD 全般（Supabase対応）
 テーブル: users / conversations / messages
 """
 import os
+import time
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -24,6 +25,22 @@ JST = timezone(timedelta(hours=9))
 # コネクションプール（アプリ起動時に1回だけ作成・再利用）
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
+# 無通信で長く置いた接続は、DB 側（Supabase のプーラーなど）で黙って切られていることがある。
+# psycopg2 は切られたことに気づかず conn.closed も 0 のままなので、
+# その接続で最初のクエリを投げた瞬間に失敗する。
+# キープアライブで切られにくくし、それでも切れていたら渡す前の確認で捨てる。
+_CONNECT_KW = dict(
+    connect_timeout=10,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=3,
+)
+# この秒数以上使っていない接続は、渡す前に SELECT 1 で生死を確かめる。
+# 使い続けている接続は確かめない（毎回の往復を増やさないため）。
+_PING_AFTER_SEC = 60
+_last_used: dict[int, float] = {}
+
 
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     """コネクションプールを取得（なければ作成）"""
@@ -34,6 +51,7 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
             maxconn=5,
             dsn=DATABASE_URL,
             cursor_factory=psycopg2.extras.RealDictCursor,
+            **_CONNECT_KW,
         )
     return _pool
 
@@ -43,33 +61,84 @@ def _now() -> str:
     return datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _is_broken(exc: BaseException, conn) -> bool:
+    """この例外のあと、接続を使い続けてよいか。
+
+    ★ 接続そのものが壊れたときに出るのは OperationalError / InterfaceError か、
+      サブクラスに分類されない素の DatabaseError（「no message from the libpq」等）。
+      SQL の誤りや一意制約違反（IntegrityError ほか DatabaseError のサブクラス）は
+      接続は無事なので、ロールバックして使い続けてよい。
+      ここで素の DatabaseError を見逃すと、壊れた接続がプールに戻り、
+      プロセスを再起動するまで以後のクエリがすべて同じエラーになる。
+    """
+    if getattr(conn, "closed", 1):
+        return True
+    if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        return True
+    return type(exc) is psycopg2.DatabaseError
+
+
+def _discard(pool, conn) -> None:
+    """壊れた接続をプールに戻さずに閉じる。"""
+    _last_used.pop(id(conn), None)
+    try:
+        pool.putconn(conn, close=True)
+    except Exception:
+        pass
+
+
+def _checkout(pool):
+    """生きている接続を1本取り出す。
+
+    しばらく使っていなかった接続は SELECT 1 で確かめ、死んでいれば捨てて取り直す。
+    プールに死んだ接続が何本か溜まっていても、最大本数ぶん試せば新しい接続に当たる。
+    """
+    last_exc = None
+    for _ in range(pool.maxconn + 1):
+        conn = pool.getconn()
+        if conn.closed:
+            _discard(pool, conn)
+            continue
+        idle = time.monotonic() - _last_used.get(id(conn), 0.0)
+        if idle < _PING_AFTER_SEC:
+            return conn
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()            # 確認用のトランザクションを閉じておく
+            return conn
+        except psycopg2.Error as e:
+            last_exc = e
+            _discard(pool, conn)
+    raise last_exc or psycopg2.OperationalError("使える接続を取得できませんでした")
+
+
 @contextmanager
 def get_conn():
     """コネクションプールから接続を取得するコンテキストマネージャー"""
     pool = _get_pool()
-    conn = pool.getconn()
+    conn = _checkout(pool)
     try:
-        # 切断されていた場合は再接続
-        if conn.closed:
-            pool.putconn(conn, close=True)
-            conn = pool.getconn()
         yield conn
         conn.commit()
-    except psycopg2.OperationalError:
-        # 接続エラー時はプールをリセットして再試行
-        conn.rollback()
-        pool.putconn(conn, close=True)
-        global _pool
-        _pool = None
-        raise
-    except Exception:
-        conn.rollback()
+    except Exception as e:
+        broken = isinstance(e, psycopg2.Error) and _is_broken(e, conn)
+        if not broken:
+            try:
+                conn.rollback()
+            except psycopg2.Error:
+                broken = True
+        if broken:
+            _discard(pool, conn)
+            conn = None
         raise
     finally:
-        try:
-            pool.putconn(conn)
-        except Exception:
-            pass
+        if conn is not None:
+            _last_used[id(conn)] = time.monotonic()
+            try:
+                pool.putconn(conn)
+            except Exception:
+                pass
 
 
 # =============================================================

@@ -16,6 +16,8 @@ from db import (
     get_conversations_by_user, get_messages_by_conversation, get_conversation,
 )
 from auth import login, logout, require_login, require_admin
+import sys
+import psycopg2
 
 # =============================================================
 # アプリ年度識別（R7=令和7年度版 / R8=令和8年度版）
@@ -964,7 +966,8 @@ def _start_scheduler():
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         from db import delete_old_conversations
-        scheduler = BackgroundScheduler()
+        # 日本時間で動かす（未指定だとサーバーの時計＝多くは世界標準時になり、日本時間の11時に動いてしまう）
+        scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
         from db import delete_expired_jti
         scheduler.add_job(lambda: delete_old_conversations(days=90), "cron", hour=2, minute=0)
         # 期限切れのSSOトークンIDを掃除する（保持し続ける意味がないため）
@@ -1567,7 +1570,12 @@ if _sso_token:
     if not st.session_state.authenticated:
         import sso as _sso
 
-        _sso_user, _sso_err, _sso_ret = _sso.authenticate(_sso_token)
+        try:
+            _sso_user, _sso_err, _sso_ret = _sso.authenticate(_sso_token)
+        except psycopg2.Error as e:
+            # トレースバックを利用者に見せない。本当の理由はサーバーのログに残す。
+            print(f"[sso] db_error {type(e).__name__}: {str(e).strip()[:200]}", file=sys.stderr, flush=True)
+            _sso_user, _sso_err, _sso_ret = None, "db_error", ""
         if _sso_user:
             st.session_state.authenticated = True
             st.session_state.user_id      = _sso_user["id"]
@@ -1646,6 +1654,10 @@ if st.session_state.app_state == "login":
             _sso.E_NOT_ALLOWED: (
                 "このアカウントではご利用いただけません。担当者までお問い合わせください。"
             ),
+            "db_error": (
+                "現在、一時的にログインできません。"
+                "少し時間をおいてから、もう一度お試しください。"
+            ),
             _sso.E_NOT_CONFIGURED: (
                 "外部システムからのログインは現在ご利用いただけません。"
                 "下記のIDとパスワードでログインしてください。"
@@ -1689,8 +1701,18 @@ if st.session_state.app_state == "login":
             submitted = st.form_submit_button("ログイン", use_container_width=True, type="primary")
 
         if submitted:
-            user = login(input_username, input_password)
-            if user:
+            # DB に一時的につながらないときに、Streamlit 既定のトレースバック
+            # （ファイルパス入り）が利用者に出ないようにする。
+            # ★ config.toml の showErrorDetails は Streamlit Cloud 側の設定に上書きされ、効かない。
+            try:
+                user = login(input_username, input_password)
+                db_down = False
+            except psycopg2.Error as e:
+                print(f"[login] db_error {type(e).__name__}: {str(e).strip()[:200]}", file=sys.stderr, flush=True)
+                user, db_down = None, True
+            if db_down:
+                st.error("現在、一時的にログインできません。少し時間をおいてから、もう一度お試しください。")
+            elif user:
                 st.session_state.authenticated  = True
                 st.session_state.user_id        = user["id"]
                 st.session_state.display_name   = user["display_name"]
