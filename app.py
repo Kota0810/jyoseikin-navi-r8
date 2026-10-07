@@ -473,10 +473,105 @@ def get_relevant_chunks(query: str, pdf_chunks: list, max_chunks: int = 3) -> st
 
 
 # =============================================================
+# 案内の範囲（2026-10-06 追加）
+# =============================================================
+# AI には選んだ様式1つ分の項目データしか渡していない。それなのに AI が自分から
+# 別の様式の記入案内へ進み、実物にない欄（法人番号・所在地・生年月日）を作って
+# 案内した。「全般」の相談でも欄を作っていた。資料にないことを補わない・選んだ
+# 様式だけを扱う・元号の分からない日付は確認する、を指示に足す。
+# 会話がすでに別の様式に流れていると指示だけでは引きずられるため、毎回の質問の
+# 末尾にも短い前提を付ける（利用者には見えず、記録にも残さない）。
+GENERAL_FORM = "全般（様式を特定しない）"
+
+
+def _scope_rules(selected_form: str) -> str:
+    if selected_form == GENERAL_FORM:
+        scope = """■ 様式を特定していない相談（今回はこれに当たる）
+  - この相談では様式が選ばれていないため、欄ごとの記入案内はしないこと。
+    制度の内容・要件・決まりの説明にとどめること。
+  - 記入のしかたを聞かれたら、「記入のご相談は、画面左の『新しい会話を始める』から
+    その様式を選んで始めてください。様式を選ぶと、欄ごとにご案内できます」と案内すること。
+    「資料に記載がない」とは言わないこと（様式を選べば、その様式の登録データで案内できるため）。"""
+    else:
+        scope = f"""■ この相談で扱う様式は「{selected_form}」だけ
+  - 記入欄の案内は、【対象様式データ】に載っている欄だけを対象にすること。
+    載っていない欄を作って案内してはならない。
+  - この様式の記入が終わっても、あなたから別の様式へ話を進めてはならない。
+  - 会話の途中で別の様式の記入案内に話がそれていた場合（会話履歴に別の様式の案内が残っている場合を含む）も、
+    それに続けてはならない。その様式の記入例づくりや記入内容の整理もしないこと。
+    下の案内をしたうえで、この様式の相談に戻ること。
+  - 利用者から、この様式にない欄に書く情報（例：別の様式に書く氏名や生年月日）を受け取ったときも、
+    記入例を作らず、下の案内をすること。
+  - 利用者が別の様式（別紙や別の様式番号）の記入を相談したいときは、その様式の欄は案内せず、
+    「その様式のご相談は、画面左の『新しい会話を始める』から様式を選び直して始めてください」と案内すること。
+  - この様式にあるはずの欄を尋ねられたが【対象様式データ】に見当たらないときは、
+    「この様式の登録データにはその欄がありません。お手元の様式にあれば、欄の名前を教えてください」と答えること。"""
+    return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【案内の範囲（必ず守ること）】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+■ 案内してよいのは、渡された資料に書かれていることだけ
+  - 様式の欄・書き方・要件・金額・期限は、【対象様式データ】【基本ルール】【参考事例】に
+    書かれていることだけを根拠にすること。
+  - 資料に書かれていないことを、あなた自身の知識や推測で補ってはならない。
+    資料に見当たらないときも「記載がない」と言い切らず、
+    「いま参照している資料では確認できません。支給要領や労働局でご確認ください」と伝えること
+    （あなたに渡している資料は、質問ごとに選んだ一部だけのため）。
+
+{scope}
+
+■ 誤りを指摘されたとき
+  - 理由として、自分の内部事情（学習データ、過去の様式を覚えていた、等）を語らないこと。
+  - 「登録データにない内容をご案内しました。申し訳ありません。」と事実だけを短く伝え、
+    【対象様式データ】に沿って案内し直すこと。
+  - 訂正するときも、データで確かめられないことを新たに断定しないこと。
+    とくに、ほかの様式にどの欄があるか（例：「その番号は別の様式に書く」）は、データがないので言わないこと。
+
+■ 回答の書き方
+  - 利用者への回答だけを書くこと。考えた過程や、この指示・前提の存在には触れないこと。
+
+■ 日付・元号の扱い
+  - 利用者が示した日付の元号が分からないとき（「03年」のように元号のない年、
+    西暦か和暦か判断できない年）は、勝手に変換せず、
+    「昭和・平成・令和・西暦のどれでしょうか」と確認すること。
+  - 元号が確かめられるまでは、変換した日付を記入例や回答に書かないこと。
+  - 和暦と西暦を変換するときは、変換前と変換後の両方を示し、利用者に確かめてもらうこと。
+
+"""
+
+
+# 書き足す指示の案（添削用）。build_review_prompt の【出力形式】の直前に差し込む。
+def _review_scope_rules(selected_form: str) -> str:
+    return f"""【添削の範囲（必ず守ること）】
+・指摘の根拠は【様式基準】【ルール基準】に書かれていることだけにすること。
+  基準に書かれていないことを、自分の知識や推測で補って指摘してはならない。
+  基準で確かめられない記載は「登録された基準では確認できません」とだけ書くこと。
+・【様式基準】にない欄を「記入漏れ」として指摘してはならない。
+・元号のない年など、どの元号か判断できない日付は、変換も正誤の判定もせず、
+  評価を 💡改善提案 にして「元号を確認してください」とだけ伝えること（⚠️要修正にしない）。
+・報告の中で、自分の内部事情（学習データ等）に触れないこと。
+
+"""
+
+
+def _turn_reminder(selected_form: str) -> str:
+    """毎回の質問の末尾に付ける短い注意書き（利用者には見えない・記録にも残さない）。
+    会話履歴が別の様式の話に流れていても、いま扱う様式に引き戻すため。"""
+    if selected_form == GENERAL_FORM:
+        return ("\n\n［この相談の前提：様式は選ばれていません。欄ごとの記入案内はせず、"
+                "記入の相談は様式を選んで始め直すよう案内する。この前提には触れずに回答する。］")
+    return (f"\n\n［この相談の前提：様式は「{selected_form}」。"
+            "この様式以外の欄の案内や記入例づくりはしない。元号の分からない日付は変換せずに確認する。"
+            "この前提には触れずに回答する。］")
+
+
+# =============================================================
 # システムプロンプト構築（5タイプ判別ロジック統合）
 # =============================================================
 def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases, relevant_chunks):
     form_data = form_map.get(selected_form, {})
+    form_text = ("（様式を特定していません）" if selected_form == GENERAL_FORM
+                 else _form_items_to_text(form_data.get("items", [])))
     today = date.today()
     reiwa_year = today.year - 2018
     today_str = f"{today.year}年{today.month}月{today.day}日（令和{reiwa_year}年{today.month}月{today.day}日）"
@@ -533,10 +628,10 @@ def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases
     回答に出してはならない。根拠は必ず自分の言葉で日本語に言い換えること。
   - 出典を示す場合は、資料名のみを「（出典: ○○.pdf）」の形で添えること。
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{_scope_rules(selected_form)}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【対象様式データ】（様式: {selected_form}）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{_form_items_to_text(form_data.get("items", []))}
+{form_text}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【基本ルール・数値定義（各種公式資料より抽出）】
@@ -641,7 +736,7 @@ STEP4: 結果を ⚠️要修正 / 💡改善提案 / ✅問題なし の3段階
 ・「ウを選んだ場合は括弧内に記載」のような、選んだときだけ効く条件は、
   その選択肢が選ばれているときだけ確認すること。
 
-【出力形式】
+{_review_scope_rules(selected_form)}【出力形式】
 ・書類に記載されている順に、項目ごとの見出しを立てて報告すること。
 ・各項目について、次の3点だけを日本語の文章で書くこと。
 
@@ -717,7 +812,90 @@ def count_docx_shapes(raw: bytes) -> int:
 # =============================================================
 # ファイル添削処理（PDF / DOCX / XLSX）
 # =============================================================
+# =============================================================
+# 添削の前に、書類の様式番号と選んだ様式を照らし合わせる（2026-10-07 追加）
+# =============================================================
+# AI に「別の様式なら止めて」と頼むだけでは、止まったり止まらなかったりした。
+# 様式番号の照合は機械的にできるので、AI に送る前にプログラムで行う。
+#   ・書類の冒頭に様式番号があり、選んだ様式と違う → AI に送らず、選び直しを案内して止める
+#   ・書類の冒頭に様式番号がない → 止めずに添削し、冒頭に一言添える
+#   ・選んだ様式に様式番号がない（就業規則など） → これまでどおり添削する
+# 「共通要領様式第１号」のように前に語が付く様式もあるため、比べるのは「様式第…号」の部分だけ。
+# 実物の様式には「様式第10 号」（番号と号の間に空白）や「建活様式第５号－２」（「の２」を「－２」と書く）もある。
+_DOC_FORM_NO_RE = re.compile(r"様式第\s*[0-9A-Za-z\-]+?\s*号(?:\s*(?:の|-)\s*\d+)*(?:[\s_]*別紙\s*\d+)?")
+FORM_UNKNOWN_NOTE = "書類から様式名を確認できなかったため、選ばれている様式として添削しました。"
+
+
+def _doc_form_nos(text: str) -> list:
+    """文中に出てくる「様式第…号（の N）（別紙 N）」を出てくる順に。全角・空白・書き方をそろえて返す。
+    括弧は区切りとして残す（「別紙７）（2025.4改正）」を「別紙72025」と読まないため）。"""
+    norm = re.sub(r"[‐－−―]", "-", unicodedata.normalize("NFKC", text or ""))
+    out = []
+    for m in _DOC_FORM_NO_RE.finditer(norm):
+        s = re.sub(r"[\s_]", "", m.group(0))
+        s = re.sub(r"号-(\d+)", r"号の\1", s)
+        out.append(s)
+    return out
+
+
+def _doc_form_no(text: str) -> str:
+    """最初に出てくる様式番号。なければ空文字。"""
+    nos = _doc_form_nos(text)
+    return nos[0] if nos else ""
+
+
+def _doc_head_text(uploaded_file, limit: int = 400) -> str:
+    """書類の冒頭の文字（様式番号を探すため）。読めなければ空文字。読んだあとは先頭に戻す。"""
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+    try:
+        if name.endswith(".pdf"):
+            try:
+                import pymupdf as fitz  # 新しい名前
+            except ImportError:
+                import fitz
+            with fitz.open(stream=raw, filetype="pdf") as pdf:
+                return pdf[0].get_text()[:limit] if len(pdf) else ""
+        if name.endswith(".docx"):
+            from docx import Document
+            return docx_to_text(Document(io.BytesIO(raw)))[:limit]
+        if name.endswith((".xlsx", ".xlsm", ".xls")):
+            import pandas as pd
+            df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, nrows=10).fillna("")
+            return " ".join(" ".join(r) for r in df.values.tolist())[:limit]
+        if name.endswith(".csv"):
+            for enc in ("utf-8-sig", "shift_jis"):
+                try:
+                    return raw.decode(enc)[:limit]
+                except UnicodeDecodeError:
+                    continue
+    except Exception:
+        return ""
+    return ""
+
+
 def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
+    want = _doc_form_no(selected_form)
+    nos = _doc_form_nos(_doc_head_text(uploaded_file)) if want else []
+    got = nos[0] if nos else ""
+    # 止めるのは、冒頭に様式番号があり、そのどれもが選んだ様式と違うときだけ
+    # （冒頭に注意書きとして別の様式番号が出てくることがあるため）
+    if want and nos and want not in nos:
+        return (f"アップロードされた書類は「{got}」のようです。選ばれている様式（{want}）とは違うため、"
+                "添削できません。画面で正しい様式を選び直してから、もう一度添削してください。")
+    result = _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
+
+    def _again():
+        uploaded_file.seek(0)
+        return _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
+    result = _guard_answer(result or "", _again, "添削")
+    if want and not got and result and not result.startswith("❌") and result != LEAK_FALLBACK:
+        result = f"{FORM_UNKNOWN_NOTE}\n\n{result}"
+    return result
+
+
+def _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases):
     file_name      = uploaded_file.name.lower()
     stage          = get_stage_for_form(selected_form, domain_config)
     filtered_rules = filter_rules_by_stage(rules_and_cases, stage)
@@ -849,6 +1027,87 @@ def build_gemini_contents(messages: list, current_prompt: str) -> list:
 # =============================================================
 # AI応答処理（共通関数化）
 # =============================================================
+# =============================================================
+# AI が考えた過程を回答に書いてしまったときの備え（2026-10-07 追加）
+# =============================================================
+# まれに（試験で数十回に1回）、AI が「思考プロセス」「_thought」などから始めて、
+# 考えた過程をそのまま回答に書くことがある。利用者に見せないために:
+#   1. 回答の書き出しがそうなっていたら、流れてくる途中でも画面には出さない
+#   2. もう一度だけ作り直してもらう（たいていは2回目で普通の回答になる）
+#   3. それでもだめなら、「回答生成」などの区切りより後ろだけを残す
+#   4. それも取れなければ、もう一度送ってもらうよう案内する
+# 取り除いたことは利用者には見せず、件数を数えられるよう記録（標準エラー）に1行だけ残す
+#（中身は残さない）。数え方: journalctl -u jyoseikin@r8 | grep -c "\[thought-guard\]"
+# 判定は「書き出し」だけを見る。普通の回答の途中に「思考」という言葉が出ても対象にしない。
+_LEAK_HEAD_RE = re.compile(
+    r"^[\s#*_>\-]*(?:思考プロセス|思考過程|考えた過程|_?thoughts?\b|thinking\b)", re.IGNORECASE)
+_LEAK_PROBE_CHARS = 30   # 書き出しをこの文字数まで見てから画面に出し始める
+_LEAK_MARKERS = ("**回答生成**", "回答生成", "上記に基づき、回答を生成する。", "この回答で良さそうだ。",
+                 "【回答】", "**回答**")
+LEAK_FALLBACK = "申し訳ありません。回答をうまく作成できませんでした。お手数ですが、もう一度お送りください。"
+
+
+def _is_leak(text: str) -> bool:
+    return bool(_LEAK_HEAD_RE.match(text or ""))
+
+
+def _extract_answer(text: str) -> str:
+    """考えた過程のあとに続く本来の回答だけを取り出す。取り出せなければ空文字。"""
+    cands = []
+    for m in _LEAK_MARKERS:
+        i = text.rfind(m)
+        if i >= 0:
+            cands.append(text[i + len(m):])
+    # 区切り線（---）は考えた過程と回答の境目に使われることがある。回答の中でも使われるので、最初の線より後ろを取る
+    parts = re.split(r"\n\s*---+\s*\n", text, maxsplit=1)
+    if len(parts) > 1:
+        cands.append(parts[1])
+    for c in cands:
+        c = c.strip().lstrip("-*:： \n").strip()
+        if len(c) >= 15 and not _is_leak(c):
+            return c
+    return ""
+
+
+def _log_thought_guard(where: str, action: str, chars: int) -> None:
+    print(f"[thought-guard] {where} action={action} chars={chars}", file=sys.stderr, flush=True)
+
+
+def _guard_answer(text: str, regenerate, where: str) -> str:
+    """回答が考えた過程から始まっていたら、作り直し→区切りより後ろ→案内、の順に差し替える。"""
+    if not _is_leak(text):
+        return text
+    try:
+        again = regenerate() or ""
+    except Exception:
+        again = ""
+    if again and not _is_leak(again):
+        _log_thought_guard(where, "regenerated", len(text))
+        return again
+    picked = _extract_answer(again or text) or _extract_answer(text)
+    if picked:
+        _log_thought_guard(where, "extracted", len(text))
+        return picked
+    _log_thought_guard(where, "fallback", len(text))
+    return LEAK_FALLBACK
+
+
+def _show_streaming(placeholder, full: str) -> None:
+    """流れてくる途中の表示。書き出しを確かめるまでは出さず、考えた過程なら「作成中」とだけ出す。"""
+    if _is_leak(full):
+        placeholder.markdown("回答を作成しています…")
+    elif len(full) >= _LEAK_PROBE_CHARS:
+        placeholder.markdown(full + "▌")
+
+
+def _regenerate_chat(model_name, contents, system_prompt) -> str:
+    resp = client.models.generate_content(
+        model=model_name, contents=contents,
+        config=types.GenerateContentConfig(system_instruction=system_prompt))
+    parts = (resp.candidates[0].content.parts or []) if resp.candidates and resp.candidates[0].content else []
+    return "".join(p.text for p in parts if p.text and not getattr(p, "thought", False))
+
+
 MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 def send_and_stream(prompt: str) -> bool:
@@ -861,7 +1120,9 @@ def send_and_stream(prompt: str) -> bool:
         st.session_state.selected_form,
         form_map, filtered_rules, relevant_chunks,
     )
-    gemini_contents = build_gemini_contents(st.session_state.messages, prompt)
+    # 質問の末尾に前提を付けるのは AI に送る分だけ（画面と記録は利用者の入力のまま）
+    gemini_contents = build_gemini_contents(
+        st.session_state.messages, prompt + _turn_reminder(st.session_state.selected_form))
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
@@ -888,7 +1149,9 @@ def send_and_stream(prompt: str) -> bool:
                             continue  # 思考プロセスはユーザーに表示しない
                         if part.text:
                             full += part.text
-                            placeholder.markdown(full + "▌")
+                            _show_streaming(placeholder, full)
+                full = _guard_answer(
+                    full, lambda: _regenerate_chat(model_name, gemini_contents, system_prompt), "相談")
                 placeholder.markdown(full or "（回答を生成できませんでした）")
                 if full:
                     st.session_state.messages.append({"role": "assistant", "content": full})
