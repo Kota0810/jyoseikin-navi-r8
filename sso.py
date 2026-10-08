@@ -12,7 +12,10 @@ sso.py  –  他システムからの署名付きトークン（JWT）による�
     issuer     = "nss-liboffice-cloud"
     audience   = "jyoseikin-navi"
     leeway     = 30                       # 時刻ずれの許容秒数
-    return_url = "https://.../user/funding/ai-agent/sso"   # 期限切れ時の戻り先
+    # 期限切れ・使用済みのときに戻る先（発行側のSSO開始ページ）。ブランドごとに複数登録できる。
+    # トークンの ret は、ここに登録したどれかと完全に一致するときだけ使う。
+    return_urls = ["https://.../user/funding/ai-agent/sso", "https://.../user/funding/ai-agent/sso"]
+    # return_url = "https://..."          # 1つだけのときの古い書き方（読み続ける）
 
     [sso.public_keys]                     # kid -> 公開鍵PEM
     "2026-08-key1" = '''-----BEGIN PUBLIC KEY-----
@@ -26,7 +29,7 @@ from datetime import datetime, timezone
 
 import streamlit as st
 
-from db import consume_jti, get_user_by_customer_no
+from db import consume_jti, get_user_by_customer_no, update_last_login
 
 # 顧客番号の形式（C + 数字9桁）。発行側と受け側で同じガードをかける。
 CUSTOMER_NO_RE = re.compile(r"C\d{9}")
@@ -72,20 +75,54 @@ def is_enabled() -> bool:
     return bool(public_keys() and cfg.get("issuer") and cfg.get("audience"))
 
 
+def return_urls() -> list:
+    """登録した戻り先（発行側のSSO開始URL）の一覧。https のものだけ、重複なしで返す。
+
+    ブランド（まるごと／リブ）ごとにドメインが違うため、複数登録できる（return_urls）。
+    1つだけ書く古い形（return_url）も一覧の1件として読む。
+    """
+    cfg = _config()
+    raw = cfg.get("return_urls", [])
+    items = [raw] if isinstance(raw, str) else list(raw or [])
+    items.append(cfg.get("return_url", ""))
+    out = []
+    for u in items:
+        u = str(u or "").strip()
+        if u.startswith("https://") and u not in out:
+            out.append(u)
+    return out
+
+
 def return_url() -> str:
-    """期限切れ画面から戻る先（発行側のSSO開始URL）。"""
-    return str(_config().get("return_url", "") or "")
+    """トークンに戻り先が入っていないときに使う戻り先。
+
+    登録が1つだけのときはそれを返す。2つ以上あるときは、どのブランドの
+    利用者か分からないので空にする（画面では「元のタブに戻る」案内になる）。
+    """
+    urls = return_urls()
+    return urls[0] if len(urls) == 1 else ""
 
 
-def _safe_return_url(payload: dict) -> str:
+def _safe_return_url(payload: dict, info: dict | None = None):
     """トークンに含まれる戻り先(ret)を取り出す。
 
     ret は【署名検証済みのペイロードからのみ】取り出すこと。
     未検証のトークンから読むと、任意のURLを仕込まれてフィッシングの
-    踏み台にされる。念のため https のみ許可する。
+    踏み台にされる。さらに、登録した戻り先（return_urls）のどれかと
+    完全に一致するときだけ使う（発行側の不具合や鍵の流出があっても、
+    知らない行き先へのボタンを出さないため）。
+
+    戻り値: 使える ret / 一致しないときは "" / ret が無いときは None
+    （None のときだけ、呼び出し側で登録済みの1つに頼ってよい）。
     """
-    ret = str((payload or {}).get("ret", "") or "")
-    return ret if ret.startswith("https://") else ""
+    ret = str((payload or {}).get("ret", "") or "").strip()
+    if not ret:
+        return None
+    if ret in return_urls():
+        return ret
+    # 行き先そのものは記録しない（一致しなかったことだけ残す）
+    _log("warn:ret_not_registered", info or {})
+    return ""
 
 
 def _log(outcome: str, info: dict, detail: str = "") -> None:
@@ -157,7 +194,8 @@ def _verify(token: str):
         except Exception:
             expired = {}
         info["jti"] = str(expired.get("jti", "")) or None
-        return None, E_EXPIRED, _safe_return_url(expired), info, ""
+        # 読み直しに失敗した（中身を信用できない）ときは、戻り先を使わない
+        return None, E_EXPIRED, (_safe_return_url(expired, info) if expired else ""), info, ""
     except Exception as e:
         # 署名違い・iss/aud 違い・必須クレーム欠けが、画面上は同じ文言になる。
         # どれだったかはここでしか分からないので型名だけ残す。
@@ -165,16 +203,17 @@ def _verify(token: str):
 
     info["jti"] = str(payload.get("jti", "")) or None
     if not CUSTOMER_NO_RE.fullmatch(str(payload.get("sub", ""))):
-        return None, E_BAD_TOKEN, _safe_return_url(payload), info, "sub_format"
-    return payload, None, _safe_return_url(payload), info, ""
+        return None, E_BAD_TOKEN, _safe_return_url(payload, info), info, "sub_format"
+    return payload, None, _safe_return_url(payload, info), info, ""
 
 
 def authenticate(token: str):
     """トークンでログインできるか判定する。
 
     戻り値: (user, 失敗理由, 戻り先URL)
-    戻り先URLは、トークンに ret が含まれていれば署名検証済みの値。
-    含まれていなければ設定値、それも無ければ空文字。
+    戻り先URLは、トークンに ret が含まれ、登録した戻り先と一致すればその値。
+    一致しなければ空文字。ret が含まれていなければ、登録が1つだけのときはそれ、
+    そうでなければ空文字。署名を確かめられないトークンでは常に空文字。
 
     検証の順序は発行側と合意済み。とくに jti の消費は
     「署名検証が通った時点」で行い、後続処理の成否とは切り離す。
@@ -183,7 +222,8 @@ def authenticate(token: str):
     """
     # ① 署名・kid・iss・aud・exp
     payload, err, ret, info, detail = _verify(token)
-    ret = ret or return_url()          # ret が無ければ設定値にフォールバック
+    if ret is None:                    # ret が無いときだけ、登録が1つならそれに頼る
+        ret = return_url()
     if err:
         _log("deny:" + err, info, detail)
         return None, err, ret
@@ -209,6 +249,14 @@ def authenticate(token: str):
         _log("deny:" + E_NOT_ALLOWED, info,
              "admin" if user.get("is_admin") else "inactive")
         return None, E_NOT_ALLOWED, ret
+
+    # ⑤ 最終ログインを記録する（IDとパスワードでのログインと同じ）。
+    #    ここまでの判定をすべて通ったときだけ記録する。記録に失敗しても
+    #    ログインは通し、失敗したことだけをサーバーの記録に残す（2026-10-08 担当者決定）。
+    try:
+        update_last_login(user["id"])
+    except Exception as e:
+        _log("warn:last_login_failed", info, type(e).__name__)
 
     _log("ok", info)
     return user, None, ret

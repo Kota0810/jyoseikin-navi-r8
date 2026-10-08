@@ -41,6 +41,8 @@ accounts = {
 fake_db = types.ModuleType("db")
 fake_db.consume_jti = lambda jti, exp: (jti not in used) and (used.add(jti) or True)
 fake_db.get_user_by_customer_no = lambda no: accounts.get(no)
+last_logins = []                    # 最終ログインを記録した利用者ID（呼ばれた順）
+fake_db.update_last_login = lambda uid: last_logins.append(uid)
 sys.modules["db"] = fake_db
 
 # ── streamlit の secrets を差し替え ──
@@ -170,29 +172,96 @@ def check_ret(label, got, want):
     print(f"  {'OK ' if good else 'NG '} {label:<44} -> {got or '（空）'}")
     return good
 
-CFG_RET = "https://example.invalid/user/funding/ai-agent/sso"
-results.append(check_ret("署名済みの ret が採用される",
-                         ret_of(make_ret("https://marugoto.example/sso")),
-                         "https://marugoto.example/sso"))
-results.append(check_ret("ret が無ければ設定値にフォールバック", ret_of(make()), CFG_RET))
-results.append(check_ret("http:// の ret は拒否して設定値に戻す",
-                         ret_of(make_ret("http://insecure.example/sso")), CFG_RET))
-results.append(check_ret("javascript: の ret は拒否",
-                         ret_of(make_ret("javascript:alert(1)")), CFG_RET))
-results.append(check_ret("期限切れでも署名済みの ret は取り出せる",
-                         ret_of(make_ret("https://lib.example/sso", exp_delta=-60)),
-                         "https://lib.example/sso"))
+# ── 戻り先（ret）は、登録した戻り先と完全に一致するときだけ使う ──
+MARU = "https://marugoto.example/user/funding/ai-agent/sso"
+LIB = "https://lib.example/user/funding/ai-agent/sso"
+ONE = "https://example.invalid/user/funding/ai-agent/sso"
+_sso_cfg = fake_st.secrets["sso"]
+_saved = dict(_sso_cfg)
 
-# 未署名（改ざん）トークンの ret が使われないこと
+def use_urls(urls=None, single=None):
+    """登録する戻り先を差し替える（urls＝一覧の書き方、single＝1つだけの古い書き方）。"""
+    _sso_cfg.pop("return_urls", None); _sso_cfg.pop("return_url", None)
+    if urls is not None:
+        _sso_cfg["return_urls"] = urls
+    if single is not None:
+        _sso_cfg["return_url"] = single
+
 import base64 as _b64m, json as _jm
-_h = _b64m.urlsafe_b64encode(_jm.dumps({"alg":"RS256","typ":"JWT","kid":KID}).encode()).rstrip(b"=")
-_p = _b64m.urlsafe_b64encode(_jm.dumps({"iss":ISS,"aud":AUD,"sub":"C000000001",
-     "iat":int(datetime.now(tz=timezone.utc).timestamp()),
-     "exp":int((datetime.now(tz=timezone.utc)+timedelta(seconds=180)).timestamp()),
-     "jti":str(uuid.uuid4()),"ret":"https://phishing.example/steal"}).encode()).rstrip(b"=")
-tampered = (_h + b"." + _p + b".AAAA").decode()
-results.append(check_ret("署名が無効なトークンの ret は使わない",
-                         ret_of(tampered), CFG_RET))
+def tampered_with(ret):
+    """署名が合わない（中身を書き換えた）トークン。ret には登録済みの戻り先を入れておく。"""
+    h = _b64m.urlsafe_b64encode(_jm.dumps({"alg": "RS256", "typ": "JWT", "kid": KID}).encode()).rstrip(b"=")
+    p = _b64m.urlsafe_b64encode(_jm.dumps({"iss": ISS, "aud": AUD, "sub": "C000000001",
+        "iat": int(datetime.now(tz=timezone.utc).timestamp()),
+        "exp": int((datetime.now(tz=timezone.utc) + timedelta(seconds=180)).timestamp()),
+        "jti": str(uuid.uuid4()), "ret": ret}).encode()).rstrip(b"=")
+    return (h + b"." + p + b".AAAA").decode()
+
+def replayed_ret(ret):
+    t = make_ret(ret); sso.authenticate(t)
+    u, e, r = sso.authenticate(t)
+    return r if e == sso.E_REPLAYED else f"（想定外: {e}）"
+
+print("  [登録が2つ（まるごと・リブ）]")
+use_urls([MARU, LIB])
+results.append(check_ret("一致する：まるごと", ret_of(make_ret(MARU)), MARU))
+results.append(check_ret("一致する：リブ（使用済みの2回目）", replayed_ret(LIB), LIB))
+results.append(check_ret("一致する：期限切れでも使う", ret_of(make_ret(LIB, exp_delta=-60)), LIB))
+results.append(check_ret("一致しない：登録のない行き先", ret_of(make_ret("https://phishing.example/steal")), ""))
+results.append(check_ret("一致しない：末尾の / だけ違う", ret_of(make_ret(MARU + "/")), ""))
+results.append(check_ret("一致しない：? 以降が付いている", ret_of(make_ret(MARU + "?x=1")), ""))
+results.append(check_ret("一致しない：http://", ret_of(make_ret("http://marugoto.example/sso")), ""))
+results.append(check_ret("一致しない：javascript:", ret_of(make_ret("javascript:alert(1)")), ""))
+results.append(check_ret("戻り先なし：どちらか分からないので空", ret_of(make()), ""))
+results.append(check_ret("署名が合わない：登録済みの ret でも使わない", ret_of(tampered_with(MARU)), ""))
+results.append(check_ret("鍵の名前が分からない：使わない", ret_of(jwt.encode(
+    {"iss": ISS, "aud": AUD, "sub": "C000000001", "jti": str(uuid.uuid4()), "ret": MARU,
+     "iat": int(datetime.now(tz=timezone.utc).timestamp()),
+     "exp": int((datetime.now(tz=timezone.utc) + timedelta(seconds=180)).timestamp())},
+    PRIV, algorithm="RS256", headers={"kid": "unknown-kid"})), ""))
+
+print("  [登録が1つだけ（古い書き方 return_url）]")
+use_urls(single=ONE)
+results.append(check_ret("登録が1つ：戻り先なしならその1つを使う", ret_of(make()), ONE))
+results.append(check_ret("登録が1つ：一致すれば使う", ret_of(make_ret(ONE)), ONE))
+results.append(check_ret("登録が1つ：一致しなければ使わない", ret_of(make_ret(MARU)), ""))
+results.append(check_ret("登録が1つ：署名が合わなければ使わない", ret_of(tampered_with(ONE)), ""))
+
+print("  [登録なし]")
+use_urls()
+results.append(check_ret("登録なし：ret があっても使わない", ret_of(make_ret(MARU)), ""))
+results.append(check_ret("登録なし：戻り先なし", ret_of(make()), ""))
+
+_sso_cfg.clear(); _sso_cfg.update(_saved)
+
+# ── 最終ログインの記録（ログインが認められたときだけ記録する）──
+print()
+def check_login_record(label, token, want_ids, want_ok):
+    last_logins.clear()
+    user, err, _ = sso.authenticate(token)
+    good = (last_logins == want_ids) and ((user is not None) == want_ok)
+    print(f"  {'OK ' if good else 'NG '} {label:<44} -> 記録 {last_logins or 'なし'}"
+          f"／{'ログイン成功' if user else '拒否:' + str(err)}")
+    return good
+
+_t = make()
+results.append(check_login_record("成功したら最終ログインを記録する", _t, [2], True))
+results.append(check_login_record("2回目（使用済み）では記録しない", _t, [], False))
+results.append(check_login_record("期限切れでは記録しない", make(exp_delta=-60), [], False))
+results.append(check_login_record("偽造の署名では記録しない", make(priv=OTHER_PRIV), [], False))
+results.append(check_login_record("未登録の顧客番号では記録しない", make(sub="C000009999"), [], False))
+results.append(check_login_record("無効化されたアカウントでは記録しない", make(sub="C000000002"), [], False))
+results.append(check_login_record("管理者アカウントでは記録しない", make(sub="C000000003"), [], False))
+
+# 記録に失敗しても、ログインは通す（失敗はサーバーの記録にだけ残す）
+def _broken(uid):
+    raise RuntimeError("db down")
+fake_db.update_last_login = _broken
+sso.update_last_login = _broken
+_u, _e, _ = sso.authenticate(make())
+_ok = _u is not None
+print(f"  {'OK ' if _ok else 'NG '} {'記録に失敗してもログインは通す':<44} -> {'ログイン成功' if _ok else '拒否:' + str(_e)}")
+results.append(_ok)
 
 print()
 print(f"結果: {sum(results)} / {len(results)} 件が期待どおり")
