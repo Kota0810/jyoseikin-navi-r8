@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import json
 import os
 import io
@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from db import (
     create_tables, SCHEMA_VERSION,
     create_conversation, add_message, touch_conversation,
-    update_conversation_title,
+    update_conversation_title, update_conversation_form,
     get_conversations_by_user, get_messages_by_conversation, get_conversation,
 )
 from auth import login, logout, require_login, require_admin
@@ -166,6 +166,113 @@ def split_form_title(form_name: str) -> tuple[str, str]:
     if m:
         return m.group(1), base[m.end():].strip(" ・-—")
     return "", base
+
+
+# =============================================================
+# 様式の呼び方・相談中の様式の切り替え・太字の表示（2026-10-07 追加）
+# =============================================================
+# 様式はファイル名で持っているが、AI にファイル名をそのまま渡すと、回答の中で
+# 「様式第a-1号_別紙1_…_令和８年度４月８日以降.pdf」のように呼んでしまう。
+# AI と画面の文中では、見出しと同じ「様式第a-1号 別紙1（…の概要票）」の形で呼ぶ。
+_YEAR_SUFFIX_RE = re.compile(r"\s*[（(]?令和[0-9０-９]+年度.*$")
+_ANNEX_HEAD_RE = re.compile(r"^[（(]?(別紙[0-9０-９]*)[）)]?\s*(.*)$")
+
+
+def _form_display(form_name: str) -> str:
+    """文中で使う様式の呼び方。ファイル名（拡張子・「令和○年度…以降」）は使わない。"""
+    if not form_name or form_name == "全般（様式を特定しない）":
+        return form_name
+    no, name = split_form_title(form_name)
+    name = _YEAR_SUFFIX_RE.sub("", name).strip()
+    m = _ANNEX_HEAD_RE.match(name)
+    if no and m:  # 「別紙N」は番号の側に寄せる
+        no, name = f"{no} {m.group(1)}", m.group(2).strip()
+    if no and name:
+        return f"{no}（{name}）"
+    return no or name
+
+
+# 相談の途中で様式を切り替えた目印。会話の記録に残し、画面では区切りの行として出す。
+# AI にもこの行が渡るので、どこから様式が変わったかを区別できる。
+FORM_SWITCH_MARK = "【様式の切り替え】"
+# 添削を実行した目印。添削の結果は、実行した位置（会話の流れの一番下）に残す。
+REVIEW_MARK = "【添削の実行】"
+REVIEW_REPORT_HEAD = "【添削レポート】"
+
+
+def _is_switch_note(text: str) -> bool:
+    return (text or "").startswith(FORM_SWITCH_MARK)
+
+
+def _is_divider(text: str) -> bool:
+    """会話の中で区切りの行として表示するもの（様式の切り替え・添削の実行）。"""
+    return (text or "").startswith((FORM_SWITCH_MARK, REVIEW_MARK))
+
+
+def _make_conv_title(form_name: str, grant: str, course_name: str) -> str:
+    """過去の会話一覧の題名。左の欄は狭く途中で切れるので、様式名を先に出す（様式名／コース名）。
+    コースの無い制度は制度名、様式を選んでいない相談は「全般」。"""
+    head = "全般" if (not form_name or form_name == "全般（様式を特定しない）") else _form_display(form_name)
+    return "／".join(p for p in (head, course_name or grant) if p)
+
+
+def _switch_form(new_form: str) -> None:
+    """相談はそのまま、様式だけを切り替える（AI に渡す項目・右の記入項目・添削の基準が変わる）。"""
+    old = st.session_state.get("selected_form", "")
+    if not new_form or new_form == old:
+        return
+    st.session_state.selected_form = new_form
+    st.session_state.pending_item = None
+    st.session_state.review_result = ""
+    conv_id = st.session_state.get("current_conv_id")
+    # まだ何も話していない相談なら、区切りの行は出さずに様式だけ変える
+    if any(not _is_switch_note(m.get("content", "")) for m in st.session_state.get("messages", [])):
+        note = f"{FORM_SWITCH_MARK}ここから様式を「{_form_display(new_form)}」に切り替えました"
+        st.session_state.messages.append({"role": "assistant", "content": note})
+        if conv_id:
+            add_message(conv_id, "assistant", note)
+    if conv_id:
+        update_conversation_form(conv_id, new_form, _make_conv_title(
+            new_form, st.session_state.get("selected_grant", ""), st.session_state.get("selected_course_name", "")))
+
+
+def _on_form_switch(widget_key: str) -> None:
+    _switch_form(st.session_state.get(widget_key, ""))
+
+
+def _render_form_switcher(form_map: dict, domain_config: dict, where: str = "top") -> None:
+    """「切り替える」ボタン。押すと、同じ制度・同じコースの様式と「全般」の一覧が出る。
+    様式名の横（top）と、入力欄のすぐ上の帯（bottom）の2か所に置く。"""
+    order = domain_config.get("form_order", [])
+    forms = sorted(form_map.keys(), key=lambda f: order.index(f) if f in order else len(order))
+    options = ["全般（様式を特定しない）"] + forms
+    current = st.session_state.get("selected_form", "")
+    if current not in options:
+        options.insert(0, current)
+    key = f"form_switch_{where}_{st.session_state.get('current_conv_id')}_{current}"
+    label = "⇄ 様式を切り替える" if where == "top" else "⇄ 切り替える"
+    with st.popover(label, use_container_width=True):
+        st.caption("同じコースの様式から選び直します。この相談のまま続けられます。")
+        st.radio(
+            "様式", options, index=options.index(current),
+            format_func=lambda f: _form_display(f) + ("（いまの様式）" if f == current else ""),
+            key=key, label_visibility="collapsed", on_change=_on_form_switch, args=(key,),
+        )
+        st.caption("AIの案内・右の記入項目・添削の基準が、選んだ様式に切り替わります。")
+
+
+# 太字の「**」は、日本語のかぎかっこ等の隣に置くと太字として扱われず、記号のまま出る。
+# 表示するときだけ、「**」の内側に幅のない文字を挟んで太字として扱われるようにする
+# （記録は AI の回答のまま）。HTML としては扱わないので、回答の中身が画面の部品になることはない。
+_BOLD_PAIR_RE = re.compile(r"\*\*(?=\S)([^\n]+?)(?<=\S)\*\*")
+# 太字だけの行（見出し代わり。「**① 氏名**」「**記入の考え方：**」など）の次の行は、
+# 改行1つだとつながって表示される（「① 氏名助成金申請の…」）。空行を入れて段落を分ける。
+_BOLD_LINE_RE = re.compile(r"(?m)^([ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?\*\*[^\n]+?\*\*[:：]?)[ \t]*\n(?=[ \t]*\S)")
+
+
+def _md(text: str) -> str:
+    text = _BOLD_LINE_RE.sub(lambda m: m.group(1) + "\n\n", text or "")
+    return _BOLD_PAIR_RE.sub(lambda m: "**\u200b" + m.group(1) + "\u200b**", text)
 
 
 def _norm_key(text: str) -> str:
@@ -482,30 +589,44 @@ def get_relevant_chunks(query: str, pdf_chunks: list, max_chunks: int = 3) -> st
 # 会話がすでに別の様式に流れていると指示だけでは引きずられるため、毎回の質問の
 # 末尾にも短い前提を付ける（利用者には見えず、記録にも残さない）。
 GENERAL_FORM = "全般（様式を特定しない）"
+# 様式を選び直す場所（様式名の横と、入力欄のすぐ上の帯の2か所）。AI の案内文で使う。
+SWITCH_GUIDE = ("様式名の横の「⇄ 様式を切り替える」か、入力欄のすぐ上の「⇄ 切り替える」から選び直してください。"
+                "この相談のまま続けられます")
+# ほかの様式の欄を尋ねられたときの答え方（ほかの様式のデータは渡していないので断定させない）
+OTHER_FORM_RULE = f"""  - ほかの様式にどの欄があるか（例：「法人番号は様式第a-1号に書く」）は、ほかの様式のデータを渡していないので
+    断定しないこと。尋ねられたら「ほかの様式にあるかどうかは、その様式に切り替えるとご案内できます。
+    {SWITCH_GUIDE}」と答えること。"""
 
 
 def _scope_rules(selected_form: str) -> str:
+    disp = _form_display(selected_form)
     if selected_form == GENERAL_FORM:
-        scope = """■ 様式を特定していない相談（今回はこれに当たる）
+        scope = f"""■ 様式を特定していない相談（今回はこれに当たる）
   - この相談では様式が選ばれていないため、欄ごとの記入案内はしないこと。
     制度の内容・要件・決まりの説明にとどめること。
-  - 記入のしかたを聞かれたら、「記入のご相談は、画面左の『新しい会話を始める』から
-    その様式を選んで始めてください。様式を選ぶと、欄ごとにご案内できます」と案内すること。
-    「資料に記載がない」とは言わないこと（様式を選べば、その様式の登録データで案内できるため）。"""
+  - 記入のしかたを聞かれたら、「記入のご相談は、{SWITCH_GUIDE}。
+    様式を選ぶと、欄ごとにご案内できます」と案内すること。
+    「資料に記載がない」とは言わないこと（様式を選べば、その様式の登録データで案内できるため）。
+  - 会話の中に「{FORM_SWITCH_MARK}」で始まる行があるときは、それより前のやりとりは前の様式についてのもの。
+    いまは様式が選ばれていないので、前の様式の欄の案内を続けないこと。
+{OTHER_FORM_RULE}"""
     else:
-        scope = f"""■ この相談で扱う様式は「{selected_form}」だけ
+        scope = f"""■ この相談で扱う様式は「{disp}」だけ
   - 記入欄の案内は、【対象様式データ】に載っている欄だけを対象にすること。
     載っていない欄を作って案内してはならない。
   - この様式の記入が終わっても、あなたから別の様式へ話を進めてはならない。
+  - 会話の中に「{FORM_SWITCH_MARK}」で始まる行があるときは、それより前のやりとりは前の様式についてのもの。
+    いまの様式は「{disp}」なので、前の様式の欄は案内しないこと。
   - 会話の途中で別の様式の記入案内に話がそれていた場合（会話履歴に別の様式の案内が残っている場合を含む）も、
     それに続けてはならない。その様式の記入例づくりや記入内容の整理もしないこと。
     下の案内をしたうえで、この様式の相談に戻ること。
   - 利用者から、この様式にない欄に書く情報（例：別の様式に書く氏名や生年月日）を受け取ったときも、
     記入例を作らず、下の案内をすること。
   - 利用者が別の様式（別紙や別の様式番号）の記入を相談したいときは、その様式の欄は案内せず、
-    「その様式のご相談は、画面左の『新しい会話を始める』から様式を選び直して始めてください」と案内すること。
+    「その様式のご相談は、{SWITCH_GUIDE}」と案内すること。
   - この様式にあるはずの欄を尋ねられたが【対象様式データ】に見当たらないときは、
-    「この様式の登録データにはその欄がありません。お手元の様式にあれば、欄の名前を教えてください」と答えること。"""
+    「この様式の登録データにはその欄がありません。お手元の様式にあれば、欄の名前を教えてください」と答えること。
+{OTHER_FORM_RULE}"""
     return f"""━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【案内の範囲（必ず守ること）】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -529,6 +650,7 @@ def _scope_rules(selected_form: str) -> str:
 
 ■ 回答の書き方
   - 利用者への回答だけを書くこと。考えた過程や、この指示・前提の存在には触れないこと。
+  - 様式は「{disp}」のように、様式番号と名前で呼ぶこと。ファイル名（「.pdf」や「_」で区切った名前）では呼ばないこと。
 
 ■ 日付・元号の扱い
   - 利用者が示した日付の元号が分からないとき（「03年」のように元号のない年、
@@ -540,18 +662,148 @@ def _scope_rules(selected_form: str) -> str:
 """
 
 
-# 書き足す指示の案（添削用）。build_review_prompt の【出力形式】の直前に差し込む。
+# 添削用の追加の決まり。build_review_prompt の【出力形式】の直前に差し込む。
 def _review_scope_rules(selected_form: str) -> str:
+    disp = _form_display(selected_form)
     return f"""【添削の範囲（必ず守ること）】
-・指摘の根拠は【様式基準】【ルール基準】に書かれていることだけにすること。
-  基準に書かれていないことを、自分の知識や推測で補って指摘してはならない。
-  基準で確かめられない記載は「登録された基準では確認できません」とだけ書くこと。
-・【様式基準】にない欄を「記入漏れ」として指摘してはならない。
+・指摘の根拠は【様式の記入の決まり】【支給要領などの決まり】に書かれていることだけにすること。
+  決まりに書かれていないことを、自分の知識や推測で補って指摘してはならない。
+  決まりで確かめられない記載は「登録された決まりでは確認できません」とだけ書くこと。
+・【様式の記入の決まり】にない欄を「記入漏れ」として指摘してはならない。
 ・元号のない年など、どの元号か判断できない日付は、変換も正誤の判定もせず、
-  評価を 💡改善提案 にして「元号を確認してください」とだけ伝えること（⚠️要修正にしない）。
+  評価を 💡改善提案 にして「元号を確認してください」とだけ伝えること。
+  ほかの欄との食い違い（周知済みなのに未来の日付になる、など）が考えられる場合でも ⚠️要修正 にしないこと。
+  このときの修正案は「{ERA_FIX_TEXT}」の1文だけにすること。
+  具体的な元号や日付の例（「令和8年…」「西暦2008年…」など）や、どの元号と解釈したらどうなるかの説明は書かないこと
+  （出力形式の「修正案は書き換え後の文面を示す」よりも、こちらを優先する）。
 ・報告の中で、自分の内部事情（学習データ等）に触れないこと。
+・報告では自己紹介をしないこと（「添削員として」「社会保険労務士として」などと書かない）。
+  「様式基準」「ルール基準」「基準データ」などの内部の呼び名は使わず、
+  「様式の記入の決まり」「支給要領などの決まり」と書くこと。
+・様式は「{disp}」のように、様式番号と名前で呼ぶこと。ファイル名では呼ばないこと。
 
 """
+
+
+# 元号の分からない日付に使う決まった修正案（_review_scope_rules で AI に指定している1文）。
+ERA_FIX_TEXT = "元号（昭和・平成・令和）または西暦のどれかを確認し、付けて記入してください。"
+
+
+# 元号が分からないことを理由にした項目か（理由の文）と、修正案に元号・西暦つきの日付の例があるか
+_ERA_UNCLEAR_RE = re.compile(
+    r"元号(が|の|は|を|か)?(不明|分から|わから|分かりませ|わかりませ|な[いくし]|記載が?な|記載されてい?な|書かれてい?な|付いてい?な|ついてい?な|表記が?な)"
+    r"|元号[^。]{0,12}(判別でき|特定でき|判断でき|分から|わから|分かりませ|わかりませ|不明)")
+_DATED_RE = re.compile(r"(令和|平成|昭和)\s*[0-9０-９元]+\s*年|(19|20)[0-9]{2}\s*年|西暦\s*[0-9]")
+
+
+def _plain(s: str) -> str:
+    return re.sub(r"[\s*「」『』\"]", "", s or "")
+
+
+# 添削の結果の見た目をそろえるための目印。
+# 「■ ① 事業所名 評価：… 理由：…」のように1行に詰まっていても、評価・理由・修正案の前で行を分ける
+# （「その理由：」のような文中の語では分けないよう、前に空白か区切りがあるときだけ）。
+_INLINE_LABEL_RE = re.compile(r"[ \t　｜|]+(?=\**\s*(?:評価|理由|修正案)\s*\**\s*[:：])")
+_LABEL_LINE_RE = re.compile(r"^[\s>#\-・*]*?\**\s*(評価|理由|修正案)\s*\**\s*[:：]\s*\**\s*(.*?)\s*$")
+
+
+def _split_packed_labels(text: str) -> str:
+    """1行に詰まった「見出し 評価：… 理由：…」を、評価・理由・修正案の前で行に分ける。
+    前に見出しや文があるときだけ分ける（「- 評価：」のような箇条書きの記号だけなら分けない）。"""
+    out = []
+    for line in text.split("\n"):
+        while True:
+            m = next((m for m in _INLINE_LABEL_RE.finditer(line)
+                      if re.sub(r"[\s#*>\-・■□◆◇●○]", "", line[:m.start()])), None)
+            if not m:
+                break
+            out.append(line[:m.start()])
+            line = line[m.end():]
+        out.append(line)
+    return "\n".join(out)
+
+
+def _heading_text(line: str) -> str:
+    """見出しの行（「### ① 事業所名」「■ ① 事業所名」「**① 事業所名**」など）から、飾りを外した文字だけを取り出す。
+    見出しらしくない行（長い文・表・区切り線など）なら空文字を返す。"""
+    s = line.strip()
+    if not s or s.startswith(("|", "---")) or s.endswith("。") or _LABEL_LINE_RE.match(s):
+        return ""
+    s = re.sub(r"^[#\s■□◆◇●○・\-]+", "", s).replace("**", "").strip()
+    return s if 0 < len(s) <= 60 else ""
+
+
+def _layout_review(lines: list) -> list:
+    """欄ごとに「見出し（太字の1行）」「評価」「理由」「修正案」が行を分けて出るようにそろえる。"""
+    out = []
+    for line in lines:
+        m = _LABEL_LINE_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        key, rest = m.group(1), m.group(2)
+        if rest.count("**") % 2 == 1:
+            rest = rest.replace("**", "", 1).strip()
+        if key == "評価":
+            while out and not out[-1].strip():
+                out.pop()
+            if out and (h := _heading_text(out[-1])):
+                out[-1] = f"**{h}**"
+                if len(out) > 1 and out[-2].strip():
+                    out.insert(len(out) - 1, "")
+            out.append("")
+        else:
+            while out and not out[-1].strip():
+                out.pop()
+            if out:
+                out[-1] = out[-1].rstrip() + "  "
+        out.append(f"**{key}：** {rest}")
+    return out
+
+
+def _tidy_review(report: str) -> str:
+    """添削の結果を、決まりどおりの形に整える（AI が指示を守りきれないことがあるため）。
+    ・書き出しの1段落だけの前置き（「〜について添削しました」など）を外す。
+    ・元号の分からない日付の項目で、修正案に元号つきの日付の例（「令和8年…」など）が
+      書かれていたら、決まった1文（ERA_FIX_TEXT）に置き換える。
+    ・修正案が決まった1文の項目は、評価を 💡改善提案 にそろえる
+      （元号の分からない日付は確認をお願いするだけで、誤りとは扱わない）。
+    ・欄ごとに、見出し・評価・理由・修正案が行を分けて出るようにそろえる（_layout_review）。"""
+    text = report or ""
+    head, sep, rest = text.lstrip().partition("\n\n")
+    if (sep and "評価" not in head and "評価" in rest and len(head) <= 150
+            and re.search(r"添削|報告", head) and head.rstrip().endswith("。")
+            and not head.lstrip().startswith(("#", "**"))):
+        text = rest.lstrip("\n")
+        if text.startswith("---"):
+            text = text[3:].lstrip("\n")
+    text = _split_packed_labels(text)
+    lines = text.split("\n")
+    era_fix = _plain(ERA_FIX_TEXT)
+    grade_at, reason, field = None, "", None
+    for i, line in enumerate(lines):
+        label = _plain(line)
+        if label.startswith(("評価:", "評価：")):
+            grade_at, reason, field = i, "", "評価"
+        elif label.startswith(("理由:", "理由：")):
+            reason, field = label, "理由"
+        elif label.startswith(("修正案:", "修正案：")) and grade_at is not None:
+            field = "修正案"
+            at, body = i, label[4:]
+            if not body and i + 1 < len(lines):
+                at, body = i + 1, _plain(lines[i + 1])
+            if body != era_fix and _ERA_UNCLEAR_RE.search(reason) and _DATED_RE.search(body):
+                if at == i:
+                    m = re.match(r"^(.*?修正案\**\s*[:：]\s*\**\s*)", line)
+                    lines[i] = (m.group(1) if m else "修正案: ") + ERA_FIX_TEXT
+                else:
+                    lines[at] = ERA_FIX_TEXT
+                body = era_fix
+            if body == era_fix and "⚠️要修正" in lines[grade_at]:
+                lines[grade_at] = lines[grade_at].replace("⚠️要修正", "💡改善提案")
+        elif field == "理由" and label:
+            reason += label
+    return "\n".join(_layout_review(lines))
 
 
 def _turn_reminder(selected_form: str) -> str:
@@ -559,10 +811,11 @@ def _turn_reminder(selected_form: str) -> str:
     会話履歴が別の様式の話に流れていても、いま扱う様式に引き戻すため。"""
     if selected_form == GENERAL_FORM:
         return ("\n\n［この相談の前提：様式は選ばれていません。欄ごとの記入案内はせず、"
-                "記入の相談は様式を選んで始め直すよう案内する。この前提には触れずに回答する。］")
-    return (f"\n\n［この相談の前提：様式は「{selected_form}」。"
-            "この様式以外の欄の案内や記入例づくりはしない。元号の分からない日付は変換せずに確認する。"
-            "この前提には触れずに回答する。］")
+                "記入の相談は「切り替える」から様式を選ぶよう案内する。この前提には触れずに回答する。］")
+    return (f"\n\n［この相談の前提：いまの様式は「{_form_display(selected_form)}」。"
+            "それより前に切り替えた様式も含め、この様式以外の欄の案内や記入例づくりはしない。"
+            "ほかの様式にどの欄があるかは断定しない。"
+            "元号の分からない日付は変換せずに確認する。この前提には触れずに回答する。］")
 
 
 # =============================================================
@@ -629,7 +882,7 @@ def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases
   - 出典を示す場合は、資料名のみを「（出典: ○○.pdf）」の形で添えること。
 
 {_scope_rules(selected_form)}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【対象様式データ】（様式: {selected_form}）
+【対象様式データ】（様式: {_form_display(selected_form)}）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {form_text}
 
@@ -710,16 +963,18 @@ def build_review_prompt(selected_form, form_map, rules_and_cases):
     reiwa_year = today.year - 2018
     today_str = f"{today.year}年{today.month}月{today.day}日（令和{reiwa_year}年{today.month}月{today.day}日）"
     return f"""
-あなたは助成金申請書類の専門添削員（プロの社会保険労務士）です。
-アップロードされた書類を【様式基準】と【ルール基準】に照らして厳密に添削してください。
+あなたは、助成金の申請書類を提出前に点検する添削の担当です。
+アップロードされた書類の各欄を、【様式の記入の決まり】と【支給要領などの決まり】に書かれた条件の一つひとつと照らし合わせ、見落としのないよう厳密に添削してください。
+条件（通し番号の付け方・記入のしかた・選び方・日付や数の決まりなど）は、細かい点でも満たしているかを確かめ、満たしていなければ指摘してください。書かれていることが決まりに沿っているように見えても、決まりの条件を一つずつ確かめてから判断してください。
+理由には、どの決まりのどの条件と照らしたかと、書類の記載がどうなっているかを、具体的に書いてください。
 
 【本日の日付】{today_str}
 ※ 日付の過去・未来の判定は必ず上記の本日の日付を基準にしてください。
 
 【添削手順】
-STEP1: 書類の各項目を識別し、【様式基準】の該当する項目と照合する。
+STEP1: 書類の各項目を識別し、【様式の記入の決まり】の該当する項目と照合する。
 STEP2: 各記載内容が、その項目の「記入の考え方」に沿っているか確認する。
-STEP3: 数値・日付・計算値が【ルール基準】と矛盾していないか確認する。
+STEP3: 数値・日付・計算値が【支給要領などの決まり】と矛盾していないか確認する。
 STEP4: 結果を ⚠️要修正 / 💡改善提案 / ✅問題なし の3段階で報告。
 
 【選択肢がグループになっている項目の見かた】
@@ -737,23 +992,28 @@ STEP4: 結果を ⚠️要修正 / 💡改善提案 / ✅問題なし の3段階
   その選択肢が選ばれているときだけ確認すること。
 
 {_review_scope_rules(selected_form)}【出力形式】
+・前置き（「〜として添削しました」「〜に基づき添削いたしました」など）は書かず、最初の項目の見出しから書き始めること。
 ・書類に記載されている順に、項目ごとの見出しを立てて報告すること。
-・各項目について、次の3点だけを日本語の文章で書くこと。
+・各項目は、次の形で、見出し・評価・理由・修正案をそれぞれ別の行に書くこと（1行にまとめない）。
 
-    評価: ⚠️要修正 / 💡改善提案 / ✅問題なし のいずれか
-    理由: なぜそう判断したかを、根拠となる基準の内容に触れながら説明する
-    修正案: 要修正・改善提案の場合のみ、書き換え後の文面をそのまま示す
+    **① 事業所名**
+    評価：⚠️要修正 / 💡改善提案 / ✅問題なし のいずれか
+    理由：照らした決まりの条件と、書類の記載がどうなっているかを具体的に説明する
+    修正案：要修正・改善提案の場合のみ、書き換え後の文面をそのまま示す
+
+・理由は、問題がない欄でも「記載されており、決まりに沿っています」のような決まり文句で済ませず、
+  どの条件を確かめて、書類のどの記載がそれを満たしているかを書くこと。
 
 ・すべて日本語で書くこと。
-・【様式基準】【ルール基準】の記載をそのまま貼り付けてはならない。
+・【様式の記入の決まり】【支給要領などの決まり】の記載をそのまま貼り付けてはならない。
   波括弧・角括弧・引用符を使ったデータ形式や、英字の項目名を
   レポートに出してはならない。根拠は必ず自分の言葉で日本語に言い換えること。
 ・基準の出典を示す場合は、資料名のみを「（出典: ○○.pdf）」の形で添えること。
 
-【様式基準】（{selected_form}）
+【様式の記入の決まり】（{_form_display(selected_form)}）
 {_form_items_to_text(form_items)}
 
-【ルール基準】（支給要領）
+【支給要領などの決まり】（支給要領）
 {_rules_to_text(rules_and_cases)}
 """
 
@@ -890,6 +1150,8 @@ def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
         uploaded_file.seek(0)
         return _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
     result = _guard_answer(result or "", _again, "添削")
+    if result and not result.startswith("❌") and result != LEAK_FALLBACK:
+        result = _tidy_review(result)
     if want and not got and result and not result.startswith("❌") and result != LEAK_FALLBACK:
         result = f"{FORM_UNKNOWN_NOTE}\n\n{result}"
     return result
@@ -1019,6 +1281,12 @@ def build_gemini_contents(messages: list, current_prompt: str) -> list:
     history = messages[:-1][-MAX_HISTORY_MESSAGES:]  # 直近10往復に制限
     for m in history:
         role = "user" if m["role"] == "user" else "model"
+        # 切り替えの区切りの行は AI 側の行として残る。同じ話し手が続く・先頭が AI 側になるのを避ける
+        if not contents and role == "model":
+            continue
+        if contents and contents[-1].role == role:
+            contents[-1].parts.append(types.Part(text=m["content"]))
+            continue
         contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
     contents.append(types.Content(role="user", parts=[types.Part(text=current_prompt)]))
     return contents
@@ -1097,7 +1365,7 @@ def _show_streaming(placeholder, full: str) -> None:
     if _is_leak(full):
         placeholder.markdown("回答を作成しています…")
     elif len(full) >= _LEAK_PROBE_CHARS:
-        placeholder.markdown(full + "▌")
+        placeholder.markdown(_md(full) + "▌")
 
 
 def _regenerate_chat(model_name, contents, system_prompt) -> str:
@@ -1152,7 +1420,7 @@ def send_and_stream(prompt: str) -> bool:
                             _show_streaming(placeholder, full)
                 full = _guard_answer(
                     full, lambda: _regenerate_chat(model_name, gemini_contents, system_prompt), "相談")
-                placeholder.markdown(full or "（回答を生成できませんでした）")
+                placeholder.markdown(_md(full) or "（回答を生成できませんでした）")
                 if full:
                     st.session_state.messages.append({"role": "assistant", "content": full})
                     # DB に AI 応答を保存
@@ -1572,6 +1840,32 @@ footer, #MainMenu,
 .ctx-bar {
     background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
     padding: 1.1rem 1.3rem 1rem; margin-bottom: 1rem;
+}
+.st-key-ctx_bar {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 1.1rem 1.3rem 1rem; margin-bottom: 1rem; gap: .2rem;
+}
+.st-key-ctx_bar .ctx-meta { margin-top: .2rem; }
+.st-key-ctx_bar [data-testid="stPopover"] button {
+    border: 1px solid var(--navy-line); color: var(--navy); background: var(--navy-tint);
+    font-weight: 700; font-size: .85rem;
+}
+.st-key-form_strip {
+    background: var(--navy-tint); border: 1px solid var(--navy-line); border-radius: 10px;
+    padding: .35rem .8rem; margin: .4rem 0 .5rem;
+}
+.form-strip { font-size: .95rem; color: var(--ink-sub); line-height: 1.5; }
+.form-strip b { color: var(--navy); }
+.st-key-form_strip [data-testid="stPopover"] button {
+    min-height: 0; padding: .25rem .7rem; font-size: .88rem; font-weight: 700;
+    color: var(--navy); background: #fff; border: 1px solid var(--navy-line);
+}
+.form-switch-note {
+    display: flex; align-items: center; gap: 12px; margin: 1.1rem 0;
+    color: var(--navy); font-size: .82rem; font-weight: 700;
+}
+.form-switch-note::before, .form-switch-note::after {
+    content: ""; flex: 1; border-top: 1px dashed var(--navy-line);
 }
 .ctx-no {
     display: inline-block; margin-bottom: .5rem;
@@ -2121,19 +2415,14 @@ elif st.session_state.app_state == "setup":
         _start = st.button("相談を開始する", use_container_width=True, type="primary", key="setup_start")
 
     if _start:
-        # タイトルは「制度名／コース名／様式名」。コースも様式も無ければ制度名だけ。
-        _title_parts = [_sel_domain_label]
-        if _sel_course_nm:
-            _title_parts.append(_sel_course_nm)
-        if selected_form != "全般（様式を特定しない）":
-            _title_parts.append(selected_form)
-        _conv_title = "/".join(_title_parts)
+        # 題名は「様式名／コース名」（コースが無ければ制度名）。左の欄で途中が切れても様式名が見えるように先に置く
+        _new_title = _make_conv_title(selected_form, _sel_domain_label, _sel_course_nm)
         # DB に新規スレッドを作成
         conv_id = create_conversation(
             st.session_state.user_id,
             _sel_domain_key,
             selected_form,
-            title=_conv_title,
+            title=_new_title,
             course=_sel_course,
         )
         st.session_state.app_state           = "chat"
@@ -2205,10 +2494,22 @@ elif st.session_state.app_state == "chat":
                         "</div></div>",
                         unsafe_allow_html=True,
                     )
-                    st.session_state.review_result = review_document(
+                    _report = review_document(
                         uploaded_file, st.session_state.selected_form,
                         form_map, rules_and_cases,
                     )
+                    # 添削の結果は画面の上ではなく、会話の流れの一番下（実行した位置）に出す。
+                    # 区切りの行とレポートを会話の記録に残すので、開き直しても同じ位置に出る。
+                    _note = f"{REVIEW_MARK}添削を実行しました（{uploaded_file.name}）"
+                    _body = f"{REVIEW_REPORT_HEAD}\n\n{_report}"
+                    st.session_state.messages += [{"role": "assistant", "content": _note},
+                                                  {"role": "assistant", "content": _body}]
+                    _cid = st.session_state.get("current_conv_id")
+                    if _cid:
+                        add_message(_cid, "assistant", _note)
+                        add_message(_cid, "assistant", _body)
+                        touch_conversation(_cid)
+                    st.session_state.review_result = ""
                     busy_slot.empty()
                     st.rerun()
 
@@ -2279,33 +2580,30 @@ elif st.session_state.app_state == "chat":
         # 様式名はファイル名そのままなので、番号と名称に分けて整形する。
         # ※ 免責は AI の出力任せにせず常に表示する
         _form_no, _form_name = split_form_title(st.session_state.selected_form)
-        st.markdown(
-            "<div class='ctx-bar'>"
-            + (f"<span class='ctx-no'>{html.escape(_form_no)}</span>" if _form_no else "")
-            + f"<h2 class='ctx-title'>{html.escape(_form_name)}</h2>"
-            + "<div class='ctx-meta'>"
-            + f"<span class='ctx-domain'>{html.escape(st.session_state.selected_grant)}</span>"
-            # コースまで絞っている場合は、いまどのコースを見ているかを常に出す。
-            # 制度名だけだと、別コースの内容だと思い込んだまま進む恐れがある。
-            + (f"<span class='ctx-sep'></span>"
-               f"<span class='ctx-domain'>{html.escape(st.session_state.selected_course_name)}</span>"
-               if st.session_state.get("selected_course_name") else "")
-            + f"<span class='ctx-sep'></span><span>{DISCLAIMER_TEXT}</span>"
-            + "</div></div>",
-            unsafe_allow_html=True,
-        )
-
-        # 添削レポート（あれば表示）
-        if st.session_state.review_result:
-            with st.expander("添削レポート", expanded=True):
-                st.markdown(st.session_state.review_result)
-                if st.button("チャット履歴に追加"):
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": f"【添削レポート】\n\n{st.session_state.review_result}",
-                    })
-                    st.session_state.review_result = ""
-                    st.rerun()
+        # 様式名の横に「切り替える」を置く（押すと同じコースの様式と「全般」の一覧が出る）。
+        # 枠は .st-key-ctx_bar で .ctx-bar と同じ見た目にしている。
+        with st.container(key="ctx_bar"):
+            _c_title, _c_switch = st.columns([3.2, 1.25], vertical_alignment="center")
+            with _c_title:
+                st.markdown(
+                    (f"<span class='ctx-no'>{html.escape(_form_no)}</span>" if _form_no else "")
+                    + f"<h2 class='ctx-title'>{html.escape(_form_name)}</h2>",
+                    unsafe_allow_html=True,
+                )
+            with _c_switch:
+                _render_form_switcher(form_map, domain_config)
+            st.markdown(
+                "<div class='ctx-meta'>"
+                + f"<span class='ctx-domain'>{html.escape(st.session_state.selected_grant)}</span>"
+                # コースまで絞っている場合は、いまどのコースを見ているかを常に出す。
+                # 制度名だけだと、別コースの内容だと思い込んだまま進む恐れがある。
+                + (f"<span class='ctx-sep'></span>"
+                   f"<span class='ctx-domain'>{html.escape(st.session_state.selected_course_name)}</span>"
+                   if st.session_state.get("selected_course_name") else "")
+                + f"<span class='ctx-sep'></span><span>{DISCLAIMER_TEXT}</span>"
+                + "</div>",
+                unsafe_allow_html=True,
+            )
 
         # ── 前回のエラー表示 ──────────────────────────────────
         if st.session_state.last_error:
@@ -2315,8 +2613,16 @@ elif st.session_state.app_state == "chat":
         # ── チャット履歴の表示 ────────────────────────────────
         if st.session_state.messages:
             for msg in st.session_state.messages:
+                if _is_divider(msg["content"]):
+                    _mark = FORM_SWITCH_MARK if _is_switch_note(msg["content"]) else REVIEW_MARK
+                    st.markdown(
+                        f"<div class='form-switch-note'><span>"
+                        f"{html.escape(msg['content'][len(_mark):])}</span></div>",
+                        unsafe_allow_html=True,
+                    )
+                    continue
                 with st.chat_message(msg["role"]):
-                    st.markdown(msg["content"])
+                    st.markdown(_md(msg["content"]))
         elif st.session_state.pending_item is None and not st.session_state.pending_prompt:
             # 会話ゼロ件のときに白紙を見せない。最初の一手を提示する。
             st.markdown(
@@ -2361,6 +2667,19 @@ elif st.session_state.app_state == "chat":
             success = send_and_stream(_auto_prompt)
             if success:
                 st.rerun()
+
+        # ── 入力欄のすぐ上の帯（いまの様式＋切り替える）──────
+        # 会話が長くなっても、上まで戻らずに様式を確かめて切り替えられるようにする
+        with st.container(key="form_strip"):
+            _fs_l, _fs_r = st.columns([4, 1.1], vertical_alignment="center")
+            with _fs_l:
+                st.markdown(
+                    "<div class='form-strip'>いまの様式："
+                    f"<b>{html.escape(_form_display(st.session_state.selected_form))}</b></div>",
+                    unsafe_allow_html=True,
+                )
+            with _fs_r:
+                _render_form_switcher(form_map, domain_config, where="bottom")
 
         # ── 入力欄（コンポーザー）────────────────────────────
         with st.container(key="composer"):

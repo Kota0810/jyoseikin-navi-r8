@@ -515,6 +515,16 @@ def update_conversation_title(conv_id: int, title: str) -> None:
             )
 
 
+def update_conversation_form(conv_id: int, form_name: str, title: str) -> None:
+    """相談の途中で様式を切り替えたとき、その相談の様式と題名を最後に選んだ様式に変える。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE conversations SET form_name = %s, title = %s, updated_at = %s WHERE id = %s",
+                (form_name, title, _now(), conv_id),
+            )
+
+
 def touch_conversation(conv_id: int) -> None:
     """updated_at を現在時刻に更新（スレッド一覧のソート用）"""
     with get_conn() as conn:
