@@ -340,20 +340,34 @@ def get_user_by_customer_no(customer_no: str) -> dict | None:
     return dict(row) if row else None
 
 
-def consume_jti(jti: str, expires_at: str) -> bool:
+# 使用済みのトークンIDを残す長さ（トークンの有効期限から数える）。
+# 期限内の再利用を確実に断るため、有効期限より長めに残す（2026-10-08 担当者決定：1日）。
+JTI_KEEP_AFTER_EXP = timedelta(days=1)
+
+
+def consume_jti(jti: str, token_exp: datetime) -> bool:
     """トークンIDを使用済みとして記録する。既に使われていれば False を返す。
+
+    token_exp はトークンの有効期限（時刻帯つきの datetime）。
+    記録には「有効期限＋JTI_KEEP_AFTER_EXP」を日本時間の文字列で書く。
+    掃除（delete_expired_jti）は日本時間の _now() と文字列で比べるため、
+    時刻帯をここでそろえる。以前は呼び出し側が世界標準時で渡していて、
+    毎晩2:10の掃除で、まだ有効なトークンの記録まで消えていた。
 
     ★ この関数は必ず単独で呼び、単独でコミットさせること。
       アカウント検索など後続処理と同じトランザクションに入れると、
       後続で例外が出たときに記録ごとロールバックされ、
       「弾いたトークンが再利用できる」状態になる。
     """
+    if not isinstance(token_exp, datetime) or token_exp.tzinfo is None:
+        raise ValueError("token_exp には時刻帯つきの datetime を渡すこと")
+    keep_until = (token_exp.astimezone(JST) + JTI_KEEP_AFTER_EXP).strftime("%Y-%m-%d %H:%M:%S")
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO sso_used_jti (jti, used_at, expires_at) VALUES (%s, %s, %s)",
-                    (jti, _now(), expires_at),
+                    (jti, _now(), keep_until),
                 )
         return True
     except psycopg2.IntegrityError:
@@ -362,7 +376,7 @@ def consume_jti(jti: str, expires_at: str) -> bool:
 
 
 def delete_expired_jti() -> int:
-    """有効期限を過ぎたトークンIDを削除する（日次バッチから呼ぶ）。"""
+    """残す期限（consume_jti で日本時間で記録）を過ぎたトークンIDを削除する（日次バッチから呼ぶ）。"""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sso_used_jti WHERE expires_at < %s", (_now(),))

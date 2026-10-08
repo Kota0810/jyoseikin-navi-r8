@@ -189,8 +189,9 @@ def authenticate(token: str):
         return None, err, ret
 
     # ② jti を消費（db 側で独立したトランザクションとしてコミットされる）
+    #    有効期限は時刻帯つきのまま渡し、記録の時刻の書き方は db 側の1か所で決める。
     exp_at = datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc)
-    if not consume_jti(str(payload["jti"]), exp_at.strftime("%Y-%m-%d %H:%M:%S")):
+    if not consume_jti(str(payload["jti"]), exp_at):
         _log("deny:" + E_REPLAYED, info)
         return None, E_REPLAYED, ret
 
