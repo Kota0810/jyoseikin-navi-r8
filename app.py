@@ -149,6 +149,36 @@ def section_label(text: str) -> None:
 # 様式名の整え方・区切りの行・太字の表示は display_text.py（管理画面と共用）
 
 
+def _render_item_buttons(form_items: list, prefix: str) -> None:
+    """記入項目のボタンの並び。右の列（prefix="ri"）と、スマートフォンの一覧（prefix="rp"）で同じものを出す。
+    押すと、その欄についての質問を送る（pending_item に入れて画面を作り直す。一覧のダイアログもこれで閉じる）。"""
+    _prev_group = None
+    for _group, _chip, _label, item, i in build_item_rows(form_items):
+        # グループが変わったところにだけ見出しを差し込む
+        if _group != _prev_group:
+            if _group:
+                st.markdown(f"<div class='item-group'>{html.escape(_group)}</div>", unsafe_allow_html=True)
+            _prev_group = _group
+        # 表示の名前は質問文・AIに渡す資料と同じ見出し（build_item_rows）。チップは今は使わない。
+        # 切り詰めは CSS 側の3行クランプに任せる（ここで削ると語の途中で切れる）。極端に長いラベルだけ保険で丸める。
+        _text = truncate_half_width(_label, 120)
+        btn_label = f"`{_chip}`　{_text}" if _chip else _text
+        # 3行に収まらず「…」で切れる長い名前は、マウスを当てると全文が出るようにする
+        _full = f"{_group} {_label}" if _group else _label
+        _help = _full if len(_full) > 40 else None
+        if st.button(btn_label, key=f"{prefix}-{i}", use_container_width=True, help=_help):
+            st.session_state.pending_item = item
+            st.rerun()
+
+
+@st.dialog("記入項目")
+def _items_dialog(form_items: list) -> None:
+    """スマートフォンの幅で、右上の「記入項目」から開く一覧。項目を押すと質問を送って閉じる。"""
+    with st.container(key="items_dialog"):
+        st.caption("選ぶと、その欄についての質問を送信して、この一覧を閉じます。")
+        _render_item_buttons(form_items, "rp")
+
+
 def _ensure_conversation() -> int:
     """いまの相談の会話の記録を返す。まだ無ければ、いまの様式・制度・コースで作る。
     最初に何かを送るとき（質問・記入項目・最初の案内・添削）に呼ぶ。1つの相談で2つ作られることはない
@@ -2129,6 +2159,84 @@ footer, #MainMenu,
     background: var(--surface-2) !important; border: 1px dashed var(--line) !important;
     border-radius: var(--radius-sm) !important;
 }
+
+/* ───────── スマートフォンの幅だけの調整（2026-10 スマートフォン対応） ─────────
+   方針：スマートフォンで「できない」と言われない最低限。パソコン（幅 769px 以上）の見た目と動きは変えない。
+   Streamlit は幅 768px 以下で上の帯（左上のメニューのボタン）を出し、640px 以下で列を縦に並べる。
+   スマートフォンだけに出す部品（.st-key-items_fab / .st-key-menu_note / .st-key-phone_hint）は、641px 以上では隠す。 */
+@media (max-width: 768px) {
+    /* 上の帯の下に、題名が潜り込まないようにする */
+    [data-testid="stMainBlockContainer"] { padding-top: 4.4rem !important; }
+    /* 左上のメニューのボタンに「メニュー」と添える（過去の会話・添削・様式の画像はこの中） */
+    [data-testid="stSidebarCollapsedControl"] button {
+        width: auto !important; padding: 0 .55rem 0 .25rem !important; gap: .2rem;
+        border: 1px solid var(--line) !important; border-radius: 8px !important; background: var(--surface) !important;
+    }
+    [data-testid="stSidebarCollapsedControl"] button::after {
+        content: "メニュー"; font-size: .82rem; font-weight: 600; color: var(--ink-sub);
+    }
+}
+@media (max-width: 640px) {
+    /* 右の記入項目の列は出さず、右上の「記入項目」のボタンから開く */
+    [data-testid="stColumn"]:has(.right-col-header) { display: none !important; }
+    /* 右上の「記入項目」のボタン。左上の「メニュー」と対になる位置に、画面を動かしても残るように置く */
+    /* 本文の部品を横幅いっぱいにする指定（section[data-testid="stMain"] [data-testid="stVerticalBlock"]）より強く書く */
+    section[data-testid="stMain"] .st-key-items_fab {
+        position: fixed !important; top: 20px !important; right: 24px !important; left: auto !important;
+        z-index: 1000000; width: max-content !important;
+    }
+    /* メニューを開いている間は隠す（メニューの「＜」（閉じる）に重ならないように） */
+    body:has([data-testid="stSidebar"][aria-expanded="true"]) section[data-testid="stMain"] .st-key-items_fab { display: none !important; }
+    /* 中の部品は横幅いっぱいに広がる作りなので、ボタンの幅に縮める */
+    section[data-testid="stMain"] .st-key-items_fab [data-testid="stElementContainer"],
+    section[data-testid="stMain"] .st-key-items_fab .stButton { width: max-content !important; }
+    .st-key-items_fab button {
+        min-height: 38px !important; padding: 0 .7rem !important; border-radius: 8px !important;
+        border: 1px solid var(--line) !important; background: var(--surface) !important;
+        color: var(--ink-sub) !important; font-weight: 600 !important; font-size: .82rem !important;
+    }
+    .st-key-items_fab button p { font-size: .82rem !important; font-weight: 600 !important; }
+    /* 制度・コース・様式を選ぶ欄：長い名前を折り返して全部見せる（選んだ名前と、開いた一覧の両方） */
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div > div:first-child,
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div > div:first-child > div {
+        white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
+        line-height: 1.5 !important;
+    }
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div { height: auto !important; min-height: 2.5rem; }
+    /* 開いた一覧は、Streamlit の作りで1行の高さが 40px に決まっている（行の位置も 40px ずつ固定）。
+       行の高さを変えると行が重なるので、字を少し小さくして3行まで見せる（2026-10 時点の様式名・制度名・コース名 306件はすべて3行に収まる） */
+    [data-testid="stSelectboxVirtualDropdown"] li > div > div > div {
+        white-space: normal !important; overflow: hidden !important; text-overflow: clip !important;
+        display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+        font-size: .7rem; line-height: 1.18;
+    }
+}
+/* パソコン用とスマートフォン用で文を出し分ける（.pc-only は 641px 以上、.sp-only は 640px 以下だけ） */
+.sp-only { display: none !important; }
+@media (max-width: 640px) { .pc-only { display: none !important; } .sp-only { display: revert !important; } }
+@media (min-width: 641px) {
+    /* 部品の外側の入れ物（stVerticalBlockBorderWrapper）ごと隠す。中だけ隠すと、並びのすき間が1つ残ってパソコンの見た目が変わる */
+    [data-testid="stVerticalBlockBorderWrapper"]:has(> div > .st-key-items_fab),
+    [data-testid="stVerticalBlockBorderWrapper"]:has(> div > .st-key-menu_note),
+    [data-testid="stVerticalBlockBorderWrapper"]:has(> div > .st-key-phone_hint) { display: none !important; }
+}
+/* 「記入項目」の一覧（ダイアログ）の中の項目は、右の列と同じ見た目（左寄せ・枠なし・行ごとの罫線・3行まで） */
+.st-key-items_dialog [data-testid="stElementContainer"]:has(.stButton)
++ [data-testid="stElementContainer"]:has(.stButton) { border-top: 1px solid var(--line-soft); }
+.st-key-items_dialog .stButton button[kind="secondary"] {
+    justify-content: flex-start !important; text-align: left !important;
+    font-weight: 500 !important; font-size: .86rem !important;
+    padding: .5rem .6rem !important; line-height: 1.6; min-height: 44px;
+    background: transparent !important; border-color: transparent !important;
+    color: var(--ink-sub) !important;
+}
+.st-key-items_dialog .stButton button p {
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    white-space: normal; overflow: hidden; margin: 0;
+    word-break: normal; overflow-wrap: break-word; line-break: strict;
+}
+/* メニューの中の一言（濃紺の面の上なので薄い色にする） */
+.st-key-menu_note [data-testid="stCaptionContainer"] p { color: #C9D3E0 !important; }
 """
 
 st.markdown(
@@ -2231,6 +2339,7 @@ if st.session_state.app_state == "login":
         """
         <style>
         .stApp { background: var(--sb-bg) !important; }
+        @media (max-width: 768px) { header[data-testid="stHeader"] { display: none !important; } }
         [data-testid="stMainBlockContainer"] {
             min-height: 100vh; display: flex; flex-direction: column; justify-content: center;
             padding-top: 1.5rem !important; padding-bottom: 1.5rem !important;
@@ -2363,6 +2472,8 @@ elif st.session_state.app_state == "setup":
     # ── サイドバー（ユーザー情報・管理画面・過去の会話） ──
     with st.sidebar:
         render_sidebar_brand()
+        with st.container(key="menu_note"):
+            st.caption("選んだあとは、右上の「＜」でメニューを閉じてください。")
         render_sidebar_user(st.session_state.display_name)
         if st.button("ログアウト", use_container_width=True, key="setup_logout"):
             logout()
@@ -2520,6 +2631,8 @@ elif st.session_state.app_state == "chat":
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     with st.sidebar:
         render_sidebar_brand()
+        with st.container(key="menu_note"):
+            st.caption("選んだあとは、右上の「＜」でメニューを閉じてください。")
 
         # ── ユーザー情報・ログアウト ──
         render_sidebar_user(st.session_state.display_name)
@@ -2638,6 +2751,12 @@ elif st.session_state.app_state == "chat":
         col_main = st.container()
         col_right = None
 
+    # ── スマートフォンの幅だけ：右上の「記入項目」のボタン（押すと一覧のダイアログが開く）──
+    if form_items:
+        with st.container(key="items_fab"):
+            if st.button("記入項目", key="items_fab_btn"):
+                _items_dialog(form_items)
+
     # ── メインカラム ──────────────────────────────────────────
     with col_main:
 
@@ -2693,9 +2812,13 @@ elif st.session_state.app_state == "chat":
             st.markdown(
                 "<div class='empty-state'>"
                 "<div class='empty-title'>この様式について相談を始めましょう</div>"
-                "<p class='empty-sub'>下の入力欄から自由に質問できます。"
+                + ("<p class='empty-sub pc-only'>" if form_items else "<p class='empty-sub'>")
+                + "下の入力欄から自由に質問できます。"
                 + ("右の記入項目を選ぶと、その欄の質問を自動で送信します。" if form_items else "")
-                + "</p></div>",
+                + "</p>"
+                + ("<p class='empty-sub sp-only'>下の入力欄から自由に質問できます。"
+                   "右上の「記入項目」から選ぶと、その欄の質問を自動で送信します。</p>" if form_items else "")
+                + "</div>",
                 unsafe_allow_html=True,
             )
             _starters = [
@@ -2749,6 +2872,11 @@ elif st.session_state.app_state == "chat":
             with _fs_r:
                 _render_form_switcher(form_map, domain_config, where="bottom")
 
+        # ── スマートフォンの幅だけ：どこから開けるかの一言 ──
+        with st.container(key="phone_hint"):
+            st.caption("添削・過去の会話は左上の「メニュー」"
+                       + ("、記入項目は右上の「記入項目」" if form_items else "") + "から開けます。")
+
         # ── 入力欄（コンポーザー）────────────────────────────
         with st.container(key="composer"):
             user_input = st.text_area(
@@ -2786,30 +2914,7 @@ elif st.session_state.app_state == "chat":
                 unsafe_allow_html=True,
             )
 
-            _prev_group = None
-            for _group, _chip, _label, item, i in build_item_rows(form_items):
-                # グループが変わったところにだけ見出しを差し込む
-                if _group != _prev_group:
-                    if _group:
-                        st.markdown(
-                            f"<div class='item-group'>{html.escape(_group)}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    _prev_group = _group
-
-                # 表示の名前は質問文・AIに渡す資料と同じ見出し（build_item_rows）。チップは今は使わない。
-                # 切り詰めは CSS 側の3行クランプに任せる（ここで削ると語の途中で切れる）。
-                # 極端に長いラベルだけ保険で丸める。
-                _text = truncate_half_width(_label, 120)
-                btn_label = f"`{_chip}`　{_text}" if _chip else _text
-                # 3行に収まらず「…」で切れる長い名前は、マウスを当てると全文が出るようにする
-                _full = f"{_group} {_label}" if _group else _label
-                _help = _full if len(_full) > 40 else None
-
-                if st.button(btn_label, key=f"ri-{i}", use_container_width=True, help=_help):
-                    st.session_state.pending_item = item
-                    st.rerun()
-
+            _render_item_buttons(form_items, "ri")
 
 # =============================================================
 # 管理画面
