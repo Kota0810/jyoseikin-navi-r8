@@ -275,66 +275,29 @@ def _md(text: str) -> str:
     return _BOLD_PAIR_RE.sub(lambda m: "**\u200b" + m.group(1) + "\u200b**", text)
 
 
-def _norm_key(text: str) -> str:
-    """比較用の正規化（記号・空白を落とす）。"""
-    return re.sub(r"[\s　()（）・_\-.,、。]", "", text or "")
-
-
-# 「①」「1」などの連番マーカー（グループ名の一部として扱う）
-_MARKER_RE = re.compile(r"^[①-⑳0-9０-９IVXivx]+$")
-
-# チップとして出してよい item_id は「条番号」のような構造マーカーだけ。
-# 自由記述の item_id（例: 社労士事務所名称）はラベルとほぼ同義で、
-# チップにすると1行目の幅を奪ってラベルが語の途中で折り返してしまう。
-_CHIP_RE = re.compile(r"^(?:第[0-9０-９]+[条項号]|[①-⑳]+|[A-Za-z]?[0-9０-９]{1,3})$")
-
-
 def build_item_rows(form_items: list) -> list:
     """右カラム用に (グループ名, 番号チップ, 表示ラベル, item, index) を組み立てる。
 
-    item_id はドメインによって性質が違うため一律にチップ表示してはいけない。
-      - 36協定       : item_id と label がほぼ同一 → チップは出さない
-      - 両立支援等   : 'A_B' の A がグループ名、B が label と同義 → A を見出しに
-      - 就業規則     : item_id='第1条' / label='(目的)' の補完関係 → チップとして出す
-
-    グループは item_id の先頭セグメント（＋連番マーカー）だけを使う。
-    全セグメントを使うと 1 項目ごとに見出しが立って逆に読みにくくなる。
+    表示の名前は、質問文・AIに渡す資料と同じ見出し（_item_headings）を使う（2026-10-09 担当者決定：
+    番号・「_」の置き換え・添え書きを3つでそろえる）。項目IDの内部の名前からはグループを作らない。
+    グループの見出しにするのは、様式に印刷された呼び名（「様式第3号①」）と「No.1」のような
+    行の番号だけで、そのときは「グループ名＋表示の名前」が見出しと同じになる。
+    番号チップは使わない（番号は名前の一部として出す）。
     """
-    draft = []
-    for i, item in enumerate(form_items):
-        item_id = (item.get("item_id") or f"項目{i + 1}").strip()
-        label   = (item.get("label") or item_id).strip()
-        # 就業規則の「(目的)」のように全体が括弧で囲まれている場合だけ外す。
-        # 「所定労働時間 (1日) (任意)」の閉じ括弧まで削ってしまわないこと。
-        if re.fullmatch(r"[（(][^（()）]*[)）]", label):
-            label = label[1:-1].strip()
-        parts   = [p for p in item_id.split("_") if p]
-
-        head = parts[:1]
-        if len(parts) > 2 and _MARKER_RE.match(parts[1]):
-            head.append(parts[1])
-        group = " ".join(head) if len(parts) > len(head) else ""
-        mid   = parts[len(head):-1] if group else []
-        last  = parts[-1] if parts else item_id
-
-        # チップは構造マーカー（第1条 など）のときだけ。かつラベルと重複しないこと。
-        n_last, n_label = _norm_key(last), _norm_key(label)
-        chip = last if (_CHIP_RE.match(last) and n_last not in n_label) else ""
-
-        # 中間セグメントはラベルに含まれていなければ前置きして文脈を戻す
-        prefix = " ".join(p for p in mid if _norm_key(p) not in n_label)
-        text   = f"{prefix} {label}".strip() if prefix else label
-
-        draft.append([group, chip, text, item, i])
-
-    # 1 項目しか属さないグループは見出しを立てない（見出しの粒度をそろえる）
+    heads = _item_headings(form_items)
+    group_re = re.compile(rf"^({_FORM_SEG}|No\.?[0-9０-９]+)\s+(\S.*)$")
+    rows = []
+    for i, (item, head) in enumerate(zip(form_items, heads)):
+        m = group_re.match(head)
+        rows.append([m.group(1), "", m.group(2), item, i] if m else ["", "", head, item, i])
+    # 1 項目しか属さないグループは見出しを立てず、見出しをそのまま出す
     counts = {}
-    for row in draft:
+    for row in rows:
         counts[row[0]] = counts.get(row[0], 0) + 1
-    for row in draft:
+    for row in rows:
         if row[0] and counts[row[0]] < 2:
-            row[0] = ""
-    return [tuple(r) for r in draft]
+            row[0], row[2] = "", heads[row[4]]
+    return [tuple(r) for r in rows]
 
 # =============================================================
 # Streamlit ページ設定（最初のStreamlitコマンドとして呼び出す必要がある）
@@ -734,7 +697,9 @@ def _heading_text(line: str) -> str:
 
 
 def _layout_review(lines: list) -> list:
-    """欄ごとに「見出し（太字の1行）」「評価」「理由」「修正案」が行を分けて出るようにそろえる。"""
+    """欄ごとに「見出し」「評価」「理由」「修正案」が行を分けて出るようにそろえる。
+    見た目は案A＋C（2026-10-08 担当者決定）：見出しは一段大きい見出し（##### → 左に色の帯。CSS の
+    .rv-head 相当は h5 の設定）、「評価」「理由」「修正案」は太字にせず色で区別する（:blue[…]）。"""
     out = []
     for line in lines:
         m = _LABEL_LINE_RE.match(line)
@@ -748,7 +713,7 @@ def _layout_review(lines: list) -> list:
             while out and not out[-1].strip():
                 out.pop()
             if out and (h := _heading_text(out[-1])):
-                out[-1] = f"**{h}**"
+                out[-1] = f"##### {h}"
                 if len(out) > 1 and out[-2].strip():
                     out.insert(len(out) - 1, "")
             out.append("")
@@ -757,7 +722,7 @@ def _layout_review(lines: list) -> list:
                 out.pop()
             if out:
                 out[-1] = out[-1].rstrip() + "  "
-        out.append(f"**{key}：** {rest}")
+        out.append(f":blue[{key}：] {rest}")
     return out
 
 
@@ -777,6 +742,8 @@ def _tidy_review(report: str) -> str:
         text = rest.lstrip("\n")
         if text.startswith("---"):
             text = text[3:].lstrip("\n")
+    # 決まった言い回しの括弧だけを外す（2026-10-08 担当者決定。ほかの言い回しは変えない）
+    text = text.replace("【様式の記入の決まり】", "様式の記入の決まり").replace("【支給要領などの決まり】", "支給要領など")
     text = _split_packed_labels(text)
     lines = text.split("\n")
     era_fix = _plain(ERA_FIX_TEXT)
@@ -913,20 +880,112 @@ def build_system_prompt(selected_grant, selected_form, form_map, rules_and_cases
 _SLUG_ID_RE = re.compile(r"^(?=[A-Za-z0-9_.\-]+$).*[A-Za-z]")
 
 
-def _form_items_to_text(items: list) -> str:
-    # 同じ label が複数ある様式（申請者の電話番号／代理人の電話番号など）では
-    # ID を伏せると区別がつかなくなる。重複する label には必ずIDを添える。
-    labels = [str(it.get("label", "")).strip() for it in items]
-    dup = {l for l in labels if l and labels.count(l) > 1}
+# ── 項目の見出し（AIに渡す資料・右の記入項目から送る質問文で使う）──
+# 項目ID（item_id）には、様式に印刷された番号（①、2(1)、11.1.(1).ソ、第3条 など）と、
+# データを作るときに付けた内部の名前（「事業主_電話番号」「別添_row3_労働者氏名」など）が混ざっている。
+# 番号は利用者もAIも欄を見分ける手がかりになるので見出しに残し、内部の名前は見出しに出さない
+# （2026-10-08 担当者決定）。同じ欄の名前が1つの様式に複数あるときだけ、内部の名前の中から
+# 利用者にも分かる部分（「3行目」「事業主」など）を添えて区別する。データ（form_structures）は変えない。
+_NUM_TOKEN = (r"(?:第[0-9０-９一二三四五六七八九十百]+[条号項章節]"
+              r"|No\.?[0-9０-９]+"
+              r"|[（(][0-9０-９A-Za-zア-ン①-⑳一二三四五六七八九十]{1,3}[）)]"
+              r"|[0-9０-９]{1,3}"
+              r"|[①-⑳㉑-㊿]"
+              r"|[A-Za-z](?![A-Za-z])"
+              r"|[ア-ン](?![ァ-ヶー一-龥ぁ-ん]))")
+_NUM_SEG = rf"{_NUM_TOKEN}(?:[.．]?{_NUM_TOKEN})*"
+# 1つのファイルに複数の様式がまとまっているもの（様式第3号①〜④ など）は、
+# 様式の呼び名も印刷された名前なので、番号と同じく見出しに残す。
+_FORM_SEG = r"様式第?[0-9０-９]+号[①-⑳0-9０-９]*"
+_NUM_PREFIX_RE = re.compile(
+    rf"^(?:{_FORM_SEG}(?:[_\-－ 　]+{_NUM_SEG})*|{_NUM_SEG}(?:[_\-－ 　]+{_NUM_SEG})*)"
+    r"(?=$|[_\-－ 　]|[^A-Za-z0-9０-９])")
+_ROW_RE = re.compile(r"^row([0-9]+)$", re.I)
 
-    lines = []
+
+# 欄の名前だけでは意味が分からないもの（日付の枠・「その他」・単位だけ など）
+_GENERIC_LABEL_RE = re.compile(r"^[\s　年月日時分()（）:：・/／\-－~〜]*$"
+                               r"|^(有|無|有・無|はい|いいえ|○|〇|□|その他|備考|金額|円|人|日|時間|数|計|合計|小計)$")
+
+
+def _item_number(item_id: str) -> str:
+    """項目IDの先頭にある、様式に印刷された番号の部分（なければ空）。区切りは空白にそろえる。"""
+    m = _NUM_PREFIX_RE.match(item_id or "")
+    return re.sub(r"[_　 ]+", " ", m.group(0)).strip(" -－") if m else ""
+
+
+def _item_qualifier(item_id: str, label: str, number: str) -> str:
+    """同じ名前の欄を見分けるための添え書き。内部の名前から、利用者にも分かる部分だけを取り出す。"""
+    m0 = _NUM_PREFIX_RE.match(item_id or "")
+    rest = (item_id or "")[len(m0.group(0)) if m0 else 0:]
+    out = []
+    for tok in re.split(r"[_\-－]+", rest):
+        tok = tok.strip(" 　")
+        if not tok or tok == label or (len(tok) >= 2 and tok in label):
+            continue
+        m = _ROW_RE.match(tok)
+        f = re.fullmatch(r"Form([0-9]+)", tok, re.I)
+        if m:
+            out.append(f"{m.group(1)}行目")
+        elif f:
+            out.append(f"様式第{f.group(1)}号")
+        elif re.fullmatch(r"[A-Za-z0-9.]+", tok) and not re.fullmatch(r"[0-9]+|No\.?[0-9]+|[A-Za-z]|[A-Z]{2,6}", tok):
+            continue                      # 英小文字の内部の名前（applicant など）は出さない。OJT・FAX などの略語は残す
+        else:
+            out.append(tok)
+    return " ".join(out)[:40]
+
+
+def _item_headings(items: list) -> list:
+    """様式の各項目の見出し（items と同じ順番）。番号＋欄の名前。内部の名前は出さない。"""
+    heads = []
     for it in items:
         item_id = str(it.get("item_id", "")).strip()
-        label   = str(it.get("label", "")).strip()
-        if label and item_id and _SLUG_ID_RE.match(item_id) and label not in dup:
-            head = label
+        # 欄の名前に入っている「_」（データの書き方）は、見出しに出すときだけ空白にする（2026-10-08 担当者決定）
+        label = re.sub(r"\s*_+\s*", " ", str(it.get("label", ""))).strip()
+        number = "" if _SLUG_ID_RE.match(item_id) else _item_number(item_id)
+        if number and label:
+            last = number.split(" ")[-1]
+            if label.startswith(number):
+                head = label
+            elif label.startswith(last):          # 「② イ」＋「イ 常用労働者」→「② イ 常用労働者」
+                head = f"{number[:-len(last)].strip()} {label}".strip()
+            else:
+                head = f"{number} {label}"
         else:
-            head = " ".join(x for x in (item_id, label) if x)
+            head = label or number or item_id
+        heads.append(head)
+    # 欄の名前だけでは何の欄か分からないもの（「その他」「年月日」「備考」「円」など）は、
+    # 同じ名前がなくても添え書きを付ける（内部の名前がその手がかりだったため）
+    for i, it in enumerate(items):
+        label = re.sub(r"\s*_+\s*", " ", str(it.get("label", ""))).strip()
+        if _GENERIC_LABEL_RE.match(label):
+            iid = str(it.get("item_id", "")).strip()
+            q = _item_qualifier(iid, label, _item_number(iid))
+            if q:
+                heads[i] = f"{heads[i]}（{q}）"
+    # 同じ見出しが2つ以上あるときだけ、添え書きで見分ける
+    for h in {h for h in heads if heads.count(h) > 1}:
+        idx = [i for i, x in enumerate(heads) if x == h]
+        quals = {}
+        for i in idx:
+            it = items[i]
+            q = _item_qualifier(str(it.get("item_id", "")).strip(), re.sub(r"\s*_+\s*", " ", str(it.get("label", ""))).strip(),
+                                _item_number(str(it.get("item_id", "")).strip()))
+            quals[i] = q
+        for n, i in enumerate(idx, 1):
+            q = quals[i]
+            if not q or list(quals.values()).count(q) > 1:
+                q = f"{q} {n}つ目".strip() if q else f"{n}つ目"
+            heads[i] = f"{h}（{q}）"
+    return heads
+
+
+def _form_items_to_text(items: list) -> str:
+    # 見出しは _item_headings で作る（様式の番号＋欄の名前。内部の名前は出さない。
+    # 同じ名前の欄は「3行目」「事業主」などを添えて見分ける）。
+    lines = []
+    for it, head in zip(items, _item_headings(items)):
         lines.append(f"■ {head or '（項目名なし）'}")
         if it.get("instruction"):
             lines.append(f"  記入の考え方: {it['instruction']}")
@@ -1835,6 +1894,12 @@ footer, #MainMenu,
     content: "あなた"; color: var(--navy);
 }
 [data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] { font-size: .9rem; line-height: 1.85; }
+/* 添削の結果の欄の見出し（_layout_review が ##### で書く。案A：一回り大きく、左に色の帯）。
+   相談の回答で AI が使うことのある ### や #### には効かせないよう、h5 だけにする */
+[data-testid="stChatMessage"] h5 { font-size: 1.0rem !important; font-weight: 700 !important; color: var(--ink) !important;
+    border-left: 4px solid var(--navy); background: var(--navy-tint); padding: .3rem .6rem !important;
+    margin: 1.1rem 0 .45rem !important; border-radius: 0 6px 6px 0; }
+[data-testid="stChatMessage"] h5 [data-testid="stHeaderActionElements"], [data-testid="stChatMessage"] h5 a { display: none !important; }
 
 /* ───────── コンテキストバー（チャット上部） ───────── */
 .ctx-bar {
@@ -2648,9 +2713,13 @@ elif st.session_state.app_state == "chat":
         if st.session_state.pending_item is not None:
             item = st.session_state.pending_item
             st.session_state.pending_item = None
-            item_id = item.get("item_id", "")
-            label   = item.get("label", "")
-            _auto_prompt = f"{item_id}「{label}」について教えてください"
+            # 質問文も、AIに渡す資料と同じ見出しで書く（内部の名前を出さない）
+            _form_items = form_map.get(st.session_state.selected_form, {}).get("items", [])
+            _heads = _item_headings(_form_items)
+            _head = next((h for it, h in zip(_form_items, _heads)
+                          if it.get("item_id") == item.get("item_id") and it.get("label") == item.get("label")),
+                         None) or _item_headings([item])[0]
+            _auto_prompt = f"「{_head}」について教えてください"
         elif st.session_state.pending_prompt:
             _auto_prompt = st.session_state.pending_prompt
             st.session_state.pending_prompt = ""
@@ -2730,8 +2799,8 @@ elif st.session_state.app_state == "chat":
                         )
                     _prev_group = _group
 
-                # チップは item_id がラベルを補完する場合だけ付く（就業規則の条番号など）
-                # 切り詰めは CSS 側の2行クランプに任せる（ここで削ると語の途中で切れる）。
+                # 表示の名前は質問文・AIに渡す資料と同じ見出し（build_item_rows）。チップは今は使わない。
+                # 切り詰めは CSS 側の3行クランプに任せる（ここで削ると語の途中で切れる）。
                 # 極端に長いラベルだけ保険で丸める。
                 _text = truncate_half_width(_label, 120)
                 btn_label = f"`{_chip}`　{_text}" if _chip else _text
