@@ -149,6 +149,26 @@ def section_label(text: str) -> None:
 # 様式名の整え方・区切りの行・太字の表示は display_text.py（管理画面と共用）
 
 
+def _ensure_conversation() -> int:
+    """いまの相談の会話の記録を返す。まだ無ければ、いまの様式・制度・コースで作る。
+    最初に何かを送るとき（質問・記入項目・最初の案内・添削）に呼ぶ。1つの相談で2つ作られることはない
+    （作ったらすぐ current_conv_id に入れ、次からはそれを使う）。"""
+    conv_id = st.session_state.get("current_conv_id")
+    if conv_id:
+        return conv_id
+    form = st.session_state.get("selected_form", "")
+    conv_id = create_conversation(
+        st.session_state.user_id,
+        st.session_state.get("selected_domain_key", ""),
+        form,
+        title=_make_conv_title(form, st.session_state.get("selected_grant", ""),
+                               st.session_state.get("selected_course_name", "")),
+        course=st.session_state.get("selected_course", ""),
+    )
+    st.session_state.current_conv_id = conv_id
+    return conv_id
+
+
 def _switch_form(new_form: str) -> None:
     """相談はそのまま、様式だけを切り替える（AI に渡す項目・右の記入項目・添削の基準が変わる）。"""
     old = st.session_state.get("selected_form", "")
@@ -2432,23 +2452,15 @@ elif st.session_state.app_state == "setup":
         _start = st.button("相談を開始する", use_container_width=True, type="primary", key="setup_start")
 
     if _start:
-        # 題名は「様式名／コース名」（コースが無ければ制度名）。左の欄で途中が切れても様式名が見えるように先に置く
-        _new_title = _make_conv_title(selected_form, _sel_domain_label, _sel_course_nm)
-        # DB に新規スレッドを作成
-        conv_id = create_conversation(
-            st.session_state.user_id,
-            _sel_domain_key,
-            selected_form,
-            title=_new_title,
-            course=_sel_course,
-        )
+        # 会話の記録は、ここではまだ作らない。最初に何かを送ったとき（質問・記入項目・最初の案内・添削）に
+        # _ensure_conversation で作る（2026-10-09 担当者決定。様式を開いただけの空の会話を残さないため）。
         st.session_state.app_state           = "chat"
         st.session_state.selected_domain_key = _sel_domain_key
         st.session_state.selected_grant      = _sel_domain_label
         st.session_state.selected_course     = _sel_course
         st.session_state.selected_course_name = _sel_course_nm
         st.session_state.selected_form       = selected_form
-        st.session_state.current_conv_id     = conv_id
+        st.session_state.current_conv_id     = None
         st.session_state.messages            = []
         st.session_state.review_result       = ""
         st.rerun()
@@ -2521,11 +2533,10 @@ elif st.session_state.app_state == "chat":
                     _body = f"{REVIEW_REPORT_HEAD}\n\n{_report}"
                     st.session_state.messages += [{"role": "assistant", "content": _note},
                                                   {"role": "assistant", "content": _body}]
-                    _cid = st.session_state.get("current_conv_id")
-                    if _cid:
-                        add_message(_cid, "assistant", _note)
-                        add_message(_cid, "assistant", _body)
-                        touch_conversation(_cid)
+                    _cid = _ensure_conversation()
+                    add_message(_cid, "assistant", _note)
+                    add_message(_cid, "assistant", _body)
+                    touch_conversation(_cid)
                     st.session_state.review_result = ""
                     busy_slot.empty()
                     st.rerun()
@@ -2678,10 +2689,9 @@ elif st.session_state.app_state == "chat":
 
         if _auto_prompt:
             st.session_state.messages.append({"role": "user", "content": _auto_prompt})
-            # DB にユーザーメッセージを保存
-            conv_id = st.session_state.get("current_conv_id")
-            if conv_id:
-                add_message(conv_id, "user", _auto_prompt)
+            # DB にユーザーメッセージを保存（会話の記録がまだ無ければ、ここで作る）
+            conv_id = _ensure_conversation()
+            add_message(conv_id, "user", _auto_prompt)
             with st.chat_message("user"):
                 st.markdown(_auto_prompt)
 
@@ -2718,10 +2728,9 @@ elif st.session_state.app_state == "chat":
         if submit and user_input.strip():
             prompt = user_input.strip()
             st.session_state.messages.append({"role": "user", "content": prompt})
-            # DB にユーザーメッセージを保存
-            conv_id = st.session_state.get("current_conv_id")
-            if conv_id:
-                add_message(conv_id, "user", prompt)
+            # DB にユーザーメッセージを保存（会話の記録がまだ無ければ、ここで作る）
+            conv_id = _ensure_conversation()
+            add_message(conv_id, "user", prompt)
             with st.chat_message("user"):
                 st.markdown(prompt)
             success = send_and_stream(prompt)

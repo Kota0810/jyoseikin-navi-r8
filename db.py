@@ -446,9 +446,9 @@ def get_conversation_counts_by_year() -> list[dict]:
 def get_all_user_stats() -> list[dict]:
     """全ユーザーの利用統計（管理画面用）。
 
-    total_conversations は質問が1つ以上ある会話だけを数える（様式を開いただけの会話は数えない。
-    2026-10-09 担当者決定。会話履歴閲覧の一覧と数をそろえる）。
-    last_question_at は最後に質問を送った日時（無ければ None）。
+    total_conversations は中身のある会話（メッセージが1つ以上＝質問か添削をした会話）だけを数える
+    （様式を開いただけの会話は数えない。2026-10-09 担当者決定。会話履歴閲覧の一覧・左の一覧と数をそろえる）。
+    last_question_at は最後に質問を送った日時、last_message_at は最後のやり取りの日時（無ければ None）。
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -459,9 +459,10 @@ def get_all_user_stats() -> list[dict]:
                     u.display_name,
                     u.is_active,
                     u.last_login_at,
-                    COUNT(DISTINCT c.id) FILTER (WHERE m.role = 'user') AS total_conversations,
+                    COUNT(DISTINCT m.conversation_id)                   AS total_conversations,
                     COUNT(m.id)                                         AS total_messages,
-                    MAX(m.created_at) FILTER (WHERE m.role = 'user')    AS last_question_at
+                    MAX(m.created_at) FILTER (WHERE m.role = 'user')    AS last_question_at,
+                    MAX(m.created_at)                                   AS last_message_at
                 FROM users u
                 LEFT JOIN conversations c ON c.user_id = u.id
                 LEFT JOIN messages m      ON m.conversation_id = c.id
@@ -490,13 +491,18 @@ def create_conversation(user_id: int, domain_key: str, form_name: str,
 
 
 def get_conversations_by_user(user_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
-    """現在のアプリ年度（APP_YEAR）の会話のみを返す。年度違いのルール混入を防ぐため。"""
+    """現在のアプリ年度（APP_YEAR）の会話のみを返す。年度違いのルール混入を防ぐため。
+
+    中身のある会話（メッセージが1つ以上＝質問か添削をした会話）だけを返す。様式を開いただけの
+    空の会話は出さない（2026-10-09 担当者決定。空の会話は消さず、90日の自動削除に任せる）。
+    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT * FROM conversations
-                   WHERE user_id = %s AND app_year = %s
-                   ORDER BY updated_at DESC
+                """SELECT * FROM conversations c
+                   WHERE c.user_id = %s AND c.app_year = %s
+                     AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)
+                   ORDER BY c.updated_at DESC
                    LIMIT %s OFFSET %s""",
                 (user_id, APP_YEAR, limit, offset),
             )
@@ -504,8 +510,9 @@ def get_conversations_by_user(user_id: int, limit: int = 20, offset: int = 0) ->
     return [dict(r) for r in rows]
 
 
-def get_question_conversations_by_user(user_id: int) -> list[dict]:
-    """質問が1つ以上ある会話だけを、最後のやり取りが新しい順に返す（管理画面の会話履歴閲覧用）。
+def get_nonempty_conversations_by_user(user_id: int) -> list[dict]:
+    """中身のある会話（メッセージが1つ以上＝質問か添削をした会話）だけを、最後のやり取りが新しい順に
+    返す（管理画面の会話履歴閲覧用）。添削だけをした会話も出す（2026-10-09 担当者決定）。
 
     n_messages は質問と回答の数（様式の切り替え・添削の実行の区切りの行は数えない）。
     last_message_at は最後のやり取りの日時。年度（app_year）をまたいで返す。
@@ -520,7 +527,6 @@ def get_question_conversations_by_user(user_id: int) -> list[dict]:
                    JOIN messages m ON m.conversation_id = c.id
                    WHERE c.user_id = %s
                    GROUP BY c.id
-                   HAVING COUNT(*) FILTER (WHERE m.role = 'user') > 0
                    ORDER BY MAX(m.created_at) DESC""",
                 ("【様式の切り替え】%", "【添削の実行】%", user_id),
             )

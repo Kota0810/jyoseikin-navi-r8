@@ -19,7 +19,7 @@ from db import (
     get_customer_no_duplicates, get_customer_no_summary,
     get_conversation_counts_by_year,
     get_all_user_stats,
-    get_question_conversations_by_user, get_messages_by_conversation,
+    get_nonempty_conversations_by_user, get_messages_by_conversation,
 )
 
 
@@ -604,7 +604,7 @@ def _render_conv_list(convs: list, uid) -> dict | None:
 
     st.markdown(_CONV_LIST_CSS, unsafe_allow_html=True)
     st.caption(
-        "質問が1つもない会話（様式を開いただけのもの）は出していません。新しい順です。"
+        "やり取りが1つもない会話（様式を開いただけのもの）は出していません。新しい順です。"
         f"　全 {len(convs)} 件中 {start + 1}〜{start + len(shown)} 件目"
     )
     if n_pages > 1:
@@ -651,7 +651,7 @@ def _render_conv_list(convs: list, uid) -> dict | None:
 
 
 def _render_conversation_viewer():
-    # 2026-10-09 作り直し：質問のある会話だけを、最後のやり取りが新しい順に出す。
+    # 2026-10-09 作り直し：中身のある会話（質問か添削をした会話）だけを、最後のやり取りが新しい順に出す。
     # 様式はファイル名ではなく相談の画面と同じ呼び方、制度はコース名まで出す。
     users = get_all_users()
     if not users:
@@ -683,7 +683,7 @@ def _render_conversation_viewer():
         filtered = [u for u in filtered if (stats.get(u["id"]) or {}).get("total_conversations")
                     or u["id"] == jump_id]
     # 最近やり取りした人を上に
-    filtered = sorted(filtered, key=lambda u: (stats.get(u["id"]) or {}).get("last_question_at") or "", reverse=True)
+    filtered = sorted(filtered, key=lambda u: (stats.get(u["id"]) or {}).get("last_message_at") or "", reverse=True)
 
     if not filtered:
         st.warning("該当するユーザーが見つかりません。検索条件や「会話がある利用者だけを出す」を変えてください。")
@@ -699,14 +699,14 @@ def _render_conversation_viewer():
     def _user_label(uid):
         u, s = user_by_id[uid], stats.get(uid) or {}
         n = s.get("total_conversations") or 0
-        tail = f"会話 {n}件・最後のやり取り {(s.get('last_question_at') or '')[:10]}" if n else "会話なし"
+        tail = f"会話 {n}件・最後のやり取り {(s.get('last_message_at') or '')[:10]}" if n else "会話なし"
         return f"{u['display_name']}（{u['username']}）— {tail}"
 
     selected_id = st.selectbox("利用者を選択", options=option_ids, format_func=_user_label, key="conv_user_select")
 
-    convs = get_question_conversations_by_user(selected_id)
+    convs = get_nonempty_conversations_by_user(selected_id)
     if not convs:
-        st.info("この利用者には、質問のある会話がありません。")
+        st.info("この利用者には、やり取りのある会話がありません。")
         return
 
     conv = _render_conv_list(convs, selected_id)
@@ -748,7 +748,7 @@ def _render_usage_stats():
         return
 
     # ── 並び替えUI ──
-    # 「最終会話順」は最後に質問を送った日時の順（2026-10-09 追加）。会話数は質問のある会話だけを数える
+    # 「最終会話順」は最後に質問を送った日時の順（2026-10-09 追加）。会話数は、やり取り（質問か添削）のある会話だけを数える
     SORT_OPTIONS = {
         "最終会話順（最後に質問を送った日時）": "last_question_at",
         "登録日順":             None,
@@ -790,7 +790,7 @@ def _render_usage_stats():
     df = df.drop(columns=["id"], errors="ignore")
     df = df[["表示名", "ログインID", "状態", "最後に質問を送った日時", "最終ログイン", "会話数", "メッセージ数"]]
 
-    st.caption("行を選択すると、その会社の会話履歴へ移動できます。会話数は質問のある会話だけの数です。記録がない欄は「記録なし」と出ます。")
+    st.caption("行を選択すると、その会社の会話履歴へ移動できます。会話数は、やり取り（質問か添削）のある会話だけの数です。記録がない欄は「記録なし」と出ます。")
     event = st.dataframe(
         df,
         use_container_width=True,
