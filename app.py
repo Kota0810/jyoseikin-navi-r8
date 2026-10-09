@@ -16,6 +16,10 @@ from db import (
     get_conversations_by_user, get_messages_by_conversation, get_conversation,
 )
 from auth import login, logout, require_login, require_admin
+from display_text import (
+    GENERAL_FORM, split_form_title, _form_display, FORM_SWITCH_MARK, REVIEW_MARK, REVIEW_REPORT_HEAD,
+    _is_switch_note, _is_divider, _divider_text, _make_conv_title, _md,
+)
 import sys
 import psycopg2
 
@@ -142,78 +146,7 @@ def section_label(text: str) -> None:
     st.markdown(f"<div class='sb-section'>{html.escape(text)}</div>", unsafe_allow_html=True)
 
 
-# =============================================================
-# 様式名・項目名の整形
-# 様式名はファイル名がそのまま入っているため、そのまま見出しにすると
-# 「様式第9号の2_特別条項付き協定届.pdf」のように拡張子とアンダースコアが
-# 露出して作りかけに見える。様式番号と名称に分けて扱う。
-# =============================================================
-_EXT_RE     = re.compile(r"\.(pdf|docx?|xlsx?|xlsm|csv)$", re.IGNORECASE)
-# 「共通要領様式第２号」「継続様式第２号」など、様式番号の前に付く語も一緒に拾う
-_FORM_NO_RE = re.compile(
-    r"^((?:[一-龥]{0,6})?様式第[0-9０-９A-Za-zＡ-Ｚａ-ｚ一二三四五六七八九十\-‐－]+号(?:の[0-9０-９]+)*[①-⑳]*"
-    r"|(?:[一-龥]{0,6})?様式[0-9０-９]+"
-    r"|第[0-9０-９]+条)"
-)
-
-
-def split_form_title(form_name: str) -> tuple[str, str]:
-    """様式名を (様式番号, 名称) に分解する。番号が無ければ ('', 名称)。"""
-    base = _EXT_RE.sub("", form_name or "")
-    base = base.replace("_", " ").replace("　", " ").strip()
-    base = re.sub(r"\s{2,}", " ", base)
-    m = _FORM_NO_RE.match(base)
-    if m:
-        return m.group(1), base[m.end():].strip(" ・-—")
-    return "", base
-
-
-# =============================================================
-# 様式の呼び方・相談中の様式の切り替え・太字の表示（2026-10-07 追加）
-# =============================================================
-# 様式はファイル名で持っているが、AI にファイル名をそのまま渡すと、回答の中で
-# 「様式第a-1号_別紙1_…_令和８年度４月８日以降.pdf」のように呼んでしまう。
-# AI と画面の文中では、見出しと同じ「様式第a-1号 別紙1（…の概要票）」の形で呼ぶ。
-_YEAR_SUFFIX_RE = re.compile(r"\s*[（(]?令和[0-9０-９]+年度.*$")
-_ANNEX_HEAD_RE = re.compile(r"^[（(]?(別紙[0-9０-９]*)[）)]?\s*(.*)$")
-
-
-def _form_display(form_name: str) -> str:
-    """文中で使う様式の呼び方。ファイル名（拡張子・「令和○年度…以降」）は使わない。"""
-    if not form_name or form_name == "全般（様式を特定しない）":
-        return form_name
-    no, name = split_form_title(form_name)
-    name = _YEAR_SUFFIX_RE.sub("", name).strip()
-    m = _ANNEX_HEAD_RE.match(name)
-    if no and m:  # 「別紙N」は番号の側に寄せる
-        no, name = f"{no} {m.group(1)}", m.group(2).strip()
-    if no and name:
-        return f"{no}（{name}）"
-    return no or name
-
-
-# 相談の途中で様式を切り替えた目印。会話の記録に残し、画面では区切りの行として出す。
-# AI にもこの行が渡るので、どこから様式が変わったかを区別できる。
-FORM_SWITCH_MARK = "【様式の切り替え】"
-# 添削を実行した目印。添削の結果は、実行した位置（会話の流れの一番下）に残す。
-REVIEW_MARK = "【添削の実行】"
-REVIEW_REPORT_HEAD = "【添削レポート】"
-
-
-def _is_switch_note(text: str) -> bool:
-    return (text or "").startswith(FORM_SWITCH_MARK)
-
-
-def _is_divider(text: str) -> bool:
-    """会話の中で区切りの行として表示するもの（様式の切り替え・添削の実行）。"""
-    return (text or "").startswith((FORM_SWITCH_MARK, REVIEW_MARK))
-
-
-def _make_conv_title(form_name: str, grant: str, course_name: str) -> str:
-    """過去の会話一覧の題名。左の欄は狭く途中で切れるので、様式名を先に出す（様式名／コース名）。
-    コースの無い制度は制度名、様式を選んでいない相談は「全般」。"""
-    head = "全般" if (not form_name or form_name == "全般（様式を特定しない）") else _form_display(form_name)
-    return "／".join(p for p in (head, course_name or grant) if p)
+# 様式名の整え方・区切りの行・太字の表示は display_text.py（管理画面と共用）
 
 
 def _switch_form(new_form: str) -> None:
@@ -259,20 +192,6 @@ def _render_form_switcher(form_map: dict, domain_config: dict, where: str = "top
             key=key, label_visibility="collapsed", on_change=_on_form_switch, args=(key,),
         )
         st.caption("AIの案内・右の記入項目・添削の基準が、選んだ様式に切り替わります。")
-
-
-# 太字の「**」は、日本語のかぎかっこ等の隣に置くと太字として扱われず、記号のまま出る。
-# 表示するときだけ、「**」の内側に幅のない文字を挟んで太字として扱われるようにする
-# （記録は AI の回答のまま）。HTML としては扱わないので、回答の中身が画面の部品になることはない。
-_BOLD_PAIR_RE = re.compile(r"\*\*(?=\S)([^\n]+?)(?<=\S)\*\*")
-# 太字だけの行（見出し代わり。「**① 氏名**」「**記入の考え方：**」など）の次の行は、
-# 改行1つだとつながって表示される（「① 氏名助成金申請の…」）。空行を入れて段落を分ける。
-_BOLD_LINE_RE = re.compile(r"(?m)^([ \t]*(?:[-*+][ \t]+|\d+[.)][ \t]+)?\*\*[^\n]+?\*\*[:：]?)[ \t]*\n(?=[ \t]*\S)")
-
-
-def _md(text: str) -> str:
-    text = _BOLD_LINE_RE.sub(lambda m: m.group(1) + "\n\n", text or "")
-    return _BOLD_PAIR_RE.sub(lambda m: "**\u200b" + m.group(1) + "\u200b**", text)
 
 
 def build_item_rows(form_items: list) -> list:
@@ -551,7 +470,7 @@ def get_relevant_chunks(query: str, pdf_chunks: list, max_chunks: int = 3) -> st
 # 様式だけを扱う・元号の分からない日付は確認する、を指示に足す。
 # 会話がすでに別の様式に流れていると指示だけでは引きずられるため、毎回の質問の
 # 末尾にも短い前提を付ける（利用者には見えず、記録にも残さない）。
-GENERAL_FORM = "全般（様式を特定しない）"
+# GENERAL_FORM（「全般（様式を特定しない）」）は display_text.py
 # 様式を選び直す場所（様式名の横と、入力欄のすぐ上の帯の2か所）。AI の案内文で使う。
 SWITCH_GUIDE = ("様式名の横の「⇄ 様式を切り替える」か、入力欄のすぐ上の「⇄ 切り替える」から選び直してください。"
                 "この相談のまま続けられます")
@@ -1567,6 +1486,39 @@ def _start_scheduler():
         pass  # スケジューラー起動失敗はアプリ動作に影響させない
 
 _start_scheduler()
+
+
+# 起動したあと最初に誰かが画面を開いたときに、全制度の知識データを裏で読み込んでおく
+# （2026-10-09 担当者決定・案4）。読み込みは制度ごとに1回だけで、ここで読んでおけば、
+# 朝いちばんに制度を開いた人も待たされない（以前は最初の1回だけ約1.4秒かかっていた）。
+# 画面を作る処理とは別の流れで動くので、開いた人の画面は待たせない。
+@st.cache_resource
+def _start_preload():
+    import threading
+    import time as _time
+
+    def _run():
+        t0, n = _time.time(), 0
+        for key in scan_domains():
+            try:
+                load_knowledge(key, mtime=_domain_mtime(key))
+                n += 1
+            except Exception as e:
+                print(f"[preload] {key} failed {type(e).__name__}", file=sys.stderr, flush=True)
+        print(f"[preload] {n} domains in {_time.time() - t0:.1f}s", file=sys.stderr, flush=True)
+
+    th = threading.Thread(target=_run, name="preload-domains", daemon=True)
+    # 画面を作っている流れの情報を渡しておく（渡さないと、読み込みのたびに記録に警告が出る）
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+        add_script_run_ctx(th, get_script_run_ctx())
+    except Exception:
+        pass
+    th.start()
+    return True
+
+
+_start_preload()
 
 # =============================================================
 # アイコン（線画SVGをCSSマスクとして流し込む）
@@ -2804,8 +2756,11 @@ elif st.session_state.app_state == "chat":
                 # 極端に長いラベルだけ保険で丸める。
                 _text = truncate_half_width(_label, 120)
                 btn_label = f"`{_chip}`　{_text}" if _chip else _text
+                # 3行に収まらず「…」で切れる長い名前は、マウスを当てると全文が出るようにする
+                _full = f"{_group} {_label}" if _group else _label
+                _help = _full if len(_full) > 40 else None
 
-                if st.button(btn_label, key=f"ri-{i}", use_container_width=True):
+                if st.button(btn_label, key=f"ri-{i}", use_container_width=True, help=_help):
                     st.session_state.pending_item = item
                     st.rerun()
 
