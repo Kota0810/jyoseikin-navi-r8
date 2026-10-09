@@ -423,6 +423,43 @@ def find_course(cfg: dict, course_key: str) -> dict:
     return next((c for c in domain_courses(cfg) if c.get("key") == course_key), {})
 
 
+@st.cache_resource(show_spinner=False)
+def _domain_names(domain_key: str, mtime: str = "") -> tuple:
+    """制度の表示名と、コースの名前の一覧（コースのキー → 名前）。左の一覧の題名を作るときに使う。
+    load_knowledge は資料ごと写しを返して重いので、domain_config.json だけを読む。mtime はキャッシュ無効化用。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "domains", domain_key, "domain_config.json")
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return cfg.get("display_name", domain_key), {c.get("key"): c.get("name", "") for c in domain_courses(cfg)}
+
+
+def _conv_label(conv: dict) -> str:
+    """左の「過去の会話」に出す題名。
+    様式の切り替えを入れる前（2026-10-08 より前）に作った会話は、題名にファイル名
+    （「…/様式第a-1号_別紙1_…_令和８年度４月８日以降.pdf」など）が入っている。
+    記録は変えずに、表示するときだけ今の形（様式名／コース名、コースが無ければ制度名）に直す。
+    コースの列が無かった頃の会話は、題名の中に入っているコース名を使う。
+    今の形の題名（「／」で区切ったもの）は、そのまま出す。"""
+    title = conv.get("title") or ""
+    if "／" in title:
+        return title
+    dom = conv.get("domain_key") or ""
+    try:
+        grant, courses = _domain_names(dom, mtime=_domain_mtime(dom))
+    except Exception:
+        return title  # 制度のデータが無いときは、記録の題名のまま
+    course_name = courses.get(conv.get("course") or "", "")
+    if not course_name:
+        hits = [n for n in courses.values() if n and n in title]
+        course_name = max(hits, key=len) if hits else ""
+    if not course_name:
+        # 古い題名は「制度/コース/様式.pdf」「制度/コース」の形。コースの区分が設定に無い制度（R7 など）は、2つ目を使う
+        parts = title.split("/")
+        if len(parts) >= 2 and parts[1].strip() and not parts[1].strip().endswith(".pdf"):
+            course_name = parts[1].strip()
+    return _make_conv_title(conv.get("form_name") or "", grant, course_name) or title
+
+
 def filter_forms_by_course(form_map: dict, cfg: dict, course_key: str) -> dict:
     """そのコースで使う様式だけに絞る。コース未指定・未設定なら素通し。"""
     course = find_course(cfg, course_key)
@@ -2341,7 +2378,7 @@ elif st.session_state.app_state == "setup":
         _conversations_setup = get_conversations_by_user(st.session_state.user_id, limit=20)
         if _conversations_setup:
             for _conv in _conversations_setup:
-                _label = _conv["title"]
+                _label = _conv_label(_conv)
                 _caption = _conv["updated_at"][:10] if _conv.get("updated_at") else ""
                 if st.button(_label, key=f"setup_conv_{_conv['id']}", use_container_width=True, help=_caption):
                     _msgs = get_messages_by_conversation(_conv["id"])
@@ -2568,7 +2605,7 @@ elif st.session_state.app_state == "chat":
         for _conv in _conversations:
             _is_current = (_conv["id"] == _current_conv)
             # 表示中のスレッドは disabled 状態のスタイル（左のネイビー罫線）で示す
-            _label = _conv["title"]
+            _label = _conv_label(_conv)
             _caption = _conv["updated_at"][:10] if _conv.get("updated_at") else ""
             if st.button(_label, key=f"conv_{_conv['id']}", use_container_width=True,
                          help=_caption, disabled=_is_current):
