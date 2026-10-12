@@ -169,7 +169,12 @@ def _render_item_buttons(form_items: list, prefix: str) -> None:
         _full = f"{_group} {_label}" if _group else _label
         _help = _full if len(_full) > 40 else None
         if st.button(btn_label, key=f"{prefix}-{i}", use_container_width=True, help=_help):
-            st.session_state.pending_item = item
+            if prefix == "rp":
+                # スマートフォンの一覧（ダイアログ）から選んだとき：まず一覧を閉じる画面を1回作り切り、
+                # 質問はその次の画面で送る（そのまま送ると、回答ができるまで薄い一覧が残るため。2026-10-12）
+                st.session_state.pending_item_after_close = item
+            else:
+                st.session_state.pending_item = item
             st.rerun()
 
 
@@ -1465,6 +1470,11 @@ def _record_ai_limit(place: str, kind: str, model: str) -> None:
     log_ai_event(place, kind)
 
 
+# 相談がAIの使用量の上限に当たったときの表示（2026-10-12 担当者決定。動きは今までどおり軽いAIで答え直す）
+CHAT_RETRY_MSG = "⏳ 混み合っているため、別のAIで答え直しています。少しお待ちください。"
+CHAT_BUSY_MSG = "混み合っていて、回答を作れませんでした。1〜2分ほどおいて、もう一度送ってください。"
+CHAT_ERROR_MSG = "回答を作れませんでした。少しおいて、もう一度送ってください。"
+
 # 添削が上限に当たったときに、同じAIでやり直すまで待つ秒数（改善メモ7：1回だけ自動でやり直す）
 REVIEW_RETRY_WAIT = int(os.getenv("JYO_REVIEW_RETRY_WAIT", "20"))
 REVIEW_BUSY_MSG = ("混み合っていて、添削できませんでした。1〜2分ほどおいて、"
@@ -1565,7 +1575,7 @@ def send_and_stream(prompt: str) -> bool:
                 # レート制限エラーの場合は次のモデルで再試行
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                     hit_limit = True
-                    placeholder.markdown(f"⏳ {model_name} のレート制限に到達。別モデルで再試行中...")
+                    placeholder.markdown(CHAT_RETRY_MSG)
                     continue
                 # レート制限以外のエラーはそのまま表示
                 break
@@ -1573,8 +1583,10 @@ def send_and_stream(prompt: str) -> bool:
         placeholder.empty()
         if hit_limit and _is_quota_error(last_error):
             _record_ai_limit("相談", "lite_fail", MODELS[-1])
-        st.error(f"エラーが発生しました: {last_error}")
-        st.session_state.last_error = str(last_error)
+        print(f"[chat] error {type(last_error).__name__}: {str(last_error).strip()[:200]}", file=sys.stderr, flush=True)
+        _msg = CHAT_BUSY_MSG if _is_quota_error(last_error) else CHAT_ERROR_MSG
+        st.warning(_msg)
+        st.session_state.last_error = _msg   # 画面を作り直したあとも、同じ分かる言葉で出す（英語のエラーは出さない）
         return False
 
 
@@ -2261,6 +2273,23 @@ footer, #MainMenu,
     content: "このファイルは選べません（PDF・Word・Excel・CSV で 200MB まで）";
     font-size: 14px; line-height: 1.5;
 }
+/* 管理画面の「顧客番号を一括で取り込む（Excel）」の欄も日本語に（2026-10-12）。白い面なので色は変えない */
+.st-key-cno_import_file [data-testid="stFileUploaderDropzoneInstructions"] > div > span,
+.st-key-cno_import_file [data-testid="stFileUploaderDropzoneInstructions"] > div > small,
+.st-key-cno_import_file [data-testid="stFileUploaderDropzone"] button,
+.st-key-cno_import_file [data-testid="stFileUploaderFileErrorMessage"] { font-size: 0 !important; }
+.st-key-cno_import_file [data-testid="stFileUploaderDropzoneInstructions"] > div > span::after {
+    content: "ここにファイルを置く"; font-size: 15px; line-height: 24px;
+}
+.st-key-cno_import_file [data-testid="stFileUploaderDropzoneInstructions"] > div > small::after {
+    content: "1ファイル200MBまで・XLSX, XLS"; font-size: 14px; line-height: 17.5px;
+}
+.st-key-cno_import_file [data-testid="stFileUploaderDropzone"] button::after {
+    content: "ファイルを選ぶ"; font-size: 15px; line-height: 24px;
+}
+.st-key-cno_import_file [data-testid="stFileUploaderFileErrorMessage"]::after {
+    content: "このファイルは選べません（Excel（.xlsx .xls）で 200MB まで）"; font-size: 14px; line-height: 1.5;
+}
 /* 選んだファイルの名前・大きさ・誤りの文が、濃紺の面に沈んで読めないので、明るい色にする（2026-10 同時に直す） */
 [data-testid="stSidebar"] [data-testid="stFileUploaderFileName"] { color: #E9EDF3 !important; }
 [data-testid="stSidebar"] [data-testid="stFileUploaderFile"] small { color: #93A3B8 !important; }
@@ -2911,7 +2940,7 @@ elif st.session_state.app_state == "chat":
 
         # ── 前回のエラー表示 ──────────────────────────────────
         if st.session_state.last_error:
-            st.error(f"前回のエラー: {st.session_state.last_error}")
+            st.warning(st.session_state.last_error)
             st.session_state.last_error = ""
 
         # ── チャット履歴の表示 ────────────────────────────────
@@ -2953,7 +2982,11 @@ elif st.session_state.app_state == "chat":
 
         # ── 項目ボタン／例示ボタンからの自動送信処理 ──────────
         _auto_prompt = ""
-        if st.session_state.pending_item is not None:
+        # 一覧から選んだ欄は、この画面では送らず、画面を作り切ってから次の画面で送る（一覧を先に閉じるため）
+        _send_after_close = st.session_state.get("pending_item_after_close") is not None
+        if _send_after_close:
+            st.session_state.pending_item = st.session_state.pop("pending_item_after_close")
+        if st.session_state.pending_item is not None and not _send_after_close:
             item = st.session_state.pending_item
             st.session_state.pending_item = None
             # 質問文も、AIに渡す資料と同じ見出しで書く（内部の名前を出さない）
@@ -3035,6 +3068,20 @@ elif st.session_state.app_state == "chat":
             )
 
             _render_item_buttons(form_items, "ri")
+
+    # 一覧から選んだ欄の質問を、この画面を作り切ってから（＝一覧が閉じてから）送る。
+    # 画面を作り切る前に作り直すと薄い一覧が残るので、0.5秒ごとに動く小さな部品で、作り切ったあとに作り直す
+    if _send_after_close:
+        st.session_state.pop("_send_tick", None)
+
+        @st.fragment(run_every=0.5)
+        def _send_after_close_tick():
+            if st.session_state.get("_send_tick"):
+                st.session_state.pop("_send_tick", None)
+                st.rerun(scope="app")
+            st.session_state["_send_tick"] = True
+
+        _send_after_close_tick()
 
 # =============================================================
 # 管理画面
