@@ -14,6 +14,7 @@ from db import (
     create_conversation, add_message, touch_conversation,
     update_conversation_title, update_conversation_form,
     get_conversations_by_user, get_messages_by_conversation, get_conversation,
+    log_ai_event,
 )
 from auth import login, logout, require_login, require_admin
 from display_text import (
@@ -21,6 +22,7 @@ from display_text import (
     _is_switch_note, _is_divider, _divider_text, _make_conv_title, _md,
 )
 import sys
+import time
 import psycopg2
 
 # =============================================================
@@ -1443,6 +1445,59 @@ def _regenerate_chat(model_name, contents, system_prompt) -> str:
 
 MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
+
+def _is_quota_error(e) -> bool:
+    """AIの使用量の上限に当たったエラーか（429 / RESOURCE_EXHAUSTED）。"""
+    s = str(e or "")
+    return "429" in s or "RESOURCE_EXHAUSTED" in s
+
+
+def _record_ai_limit(place: str, kind: str, model: str) -> None:
+    """上限に当たった出来事を、データベース（管理画面の利用統計で数える）とサーバーの記録に残す。中身は残さない。"""
+    print(f"[ai-limit] {place} {kind} model={model}", file=sys.stderr, flush=True)
+    log_ai_event(place, kind)
+
+
+# 添削が上限に当たったときに、同じAIでやり直すまで待つ秒数（改善メモ7：1回だけ自動でやり直す）
+REVIEW_RETRY_WAIT = int(os.getenv("JYO_REVIEW_RETRY_WAIT", "20"))
+REVIEW_BUSY_MSG = ("混み合っていて、添削できませんでした。1〜2分ほどおいて、"
+                   "もう一度「添削を実行」を押してください。")
+
+
+def _busy_card(title: str, sub: str) -> str:
+    return ("<div class='busy-veil'><div class='busy-card'>"
+            "<div class='busy-dots'><i></i><i></i><i></i></div>"
+            f"<div class='busy-title'>{title}</div><div class='busy-sub'>{sub}</div>"
+            "</div></div>")
+
+
+def review_with_retry(uploaded_file, selected_form, form_map, rules_and_cases, busy_slot):
+    """添削する。上限に当たったら、待っていることを画面に出して REVIEW_RETRY_WAIT 秒待ち、同じAIで1回だけやり直す。
+    やり直しても上限なら None を返す（呼ぶ側が「少し待ってからもう一度」と案内する）。上限以外のエラーはそのまま上げる。"""
+    try:
+        return review_document(uploaded_file, selected_form, form_map, rules_and_cases)
+    except Exception as e:
+        if not _is_quota_error(e):
+            raise
+    busy_slot.markdown(_busy_card(
+        "混み合っているため、少し待ってからもう一度試しています",
+        f"{REVIEW_RETRY_WAIT}秒ほどで、もう一度添削を始めます。<br>このまま開いたままお待ちください。"),
+        unsafe_allow_html=True)
+    time.sleep(REVIEW_RETRY_WAIT)
+    busy_slot.markdown(_busy_card(
+        "もう一度添削しています", "書類の量によっては1分ほどかかります。<br>このまま開いたままお待ちください。"),
+        unsafe_allow_html=True)
+    uploaded_file.seek(0)
+    try:
+        result = review_document(uploaded_file, selected_form, form_map, rules_and_cases)
+    except Exception as e:
+        if not _is_quota_error(e):
+            raise
+        _record_ai_limit("添削", "retry_fail", "gemini-2.5-flash")
+        return None
+    _record_ai_limit("添削", "retry_ok", "gemini-2.5-flash")
+    return result
+
 def send_and_stream(prompt: str) -> bool:
     """ユーザーの質問を処理してストリーミング応答を返す共通関数。成功時True"""
     stage           = get_stage_for_form(st.session_state.selected_form, domain_config)
@@ -1461,8 +1516,9 @@ def send_and_stream(prompt: str) -> bool:
         placeholder = st.empty()
         full = ""
 
-        # モデルを順に試行（2.5-flash → 2.0-flash フォールバック）
+        # モデルを順に試行（2.5-flash → 2.5-flash-lite フォールバック）
         last_error = None
+        hit_limit = False   # 上限に当たって軽いAIに切り替えたか（改善メモ5：回数を記録する）
         for model_name in MODELS:
             full = ""
             try:
@@ -1486,6 +1542,8 @@ def send_and_stream(prompt: str) -> bool:
                 full = _guard_answer(
                     full, lambda: _regenerate_chat(model_name, gemini_contents, system_prompt), "相談")
                 placeholder.markdown(_md(full) or "（回答を生成できませんでした）")
+                if hit_limit:
+                    _record_ai_limit("相談", "lite_ok", model_name)
                 if full:
                     st.session_state.messages.append({"role": "assistant", "content": full})
                     # DB に AI 応答を保存
@@ -1499,12 +1557,15 @@ def send_and_stream(prompt: str) -> bool:
                 err_str = str(e)
                 # レート制限エラーの場合は次のモデルで再試行
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    hit_limit = True
                     placeholder.markdown(f"⏳ {model_name} のレート制限に到達。別モデルで再試行中...")
                     continue
                 # レート制限以外のエラーはそのまま表示
                 break
 
         placeholder.empty()
+        if hit_limit and _is_quota_error(last_error):
+            _record_ai_limit("相談", "lite_fail", MODELS[-1])
         st.error(f"エラーが発生しました: {last_error}")
         st.session_state.last_error = str(last_error)
         return False
@@ -2159,6 +2220,16 @@ footer, #MainMenu,
     background: var(--surface-2) !important; border: 1px dashed var(--line) !important;
     border-radius: var(--radius-sm) !important;
 }
+/* 左のメニューの中の知らせ（添削の「少し待ってからもう一度」・エラー）。濃紺の上でも読めるように白い面に（2026-10-12） */
+[data-testid="stSidebar"] [data-testid="stAlertContainer"] {
+    background: #FFFFFF !important; border: 1px solid var(--line) !important;
+    border-left: 5px solid #B7791F !important; box-shadow: 0 10px 26px -14px rgba(0,0,0,.4) !important;
+}
+[data-testid="stSidebar"] [data-testid="stAlertContainer"] * { color: var(--ink) !important; }
+[data-testid="stSidebar"] [data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) {
+    border-left-color: var(--danger) !important;
+}
+[data-testid="stSidebar"] [data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) * { color: var(--danger) !important; }
 
 /* ───────── 添削の欄の文言を日本語で出す（2026-10 担当者決定） ─────────
    Streamlit にはファイルを選ぶ欄の文言を変える設定が無いので、英語の文字を見えなくして（字の大きさ 0）、
@@ -2702,23 +2773,36 @@ elif st.session_state.app_state == "chat":
                         "</div></div>",
                         unsafe_allow_html=True,
                     )
-                    _report = review_document(
-                        uploaded_file, st.session_state.selected_form,
-                        form_map, rules_and_cases,
-                    )
-                    # 添削の結果は画面の上ではなく、会話の流れの一番下（実行した位置）に出す。
-                    # 区切りの行とレポートを会話の記録に残すので、開き直しても同じ位置に出る。
-                    _note = f"{REVIEW_MARK}添削を実行しました（{uploaded_file.name}）"
-                    _body = f"{REVIEW_REPORT_HEAD}\n\n{_report}"
-                    st.session_state.messages += [{"role": "assistant", "content": _note},
-                                                  {"role": "assistant", "content": _body}]
-                    _cid = _ensure_conversation()
-                    add_message(_cid, "assistant", _note)
-                    add_message(_cid, "assistant", _body)
-                    touch_conversation(_cid)
-                    st.session_state.review_result = ""
-                    busy_slot.empty()
-                    st.rerun()
+                    _failed = False
+                    try:
+                        _report = review_with_retry(
+                            uploaded_file, st.session_state.selected_form,
+                            form_map, rules_and_cases, busy_slot,
+                        )
+                    except Exception as _e:
+                        # 上限以外のエラー。本当の理由はサーバーの記録に残し、画面には分かる言葉で出す
+                        print(f"[review] error {type(_e).__name__}: {str(_e).strip()[:200]}", file=sys.stderr, flush=True)
+                        _report, _failed = None, True
+                    if _report is None:
+                        busy_slot.empty()   # 「添削しています」を残さない
+                        if _failed:
+                            st.error("添削を完了できませんでした。少しおいて、もう一度「添削を実行」を押してください。")
+                        else:
+                            st.warning(REVIEW_BUSY_MSG)
+                    else:
+                        # 添削の結果は画面の上ではなく、会話の流れの一番下（実行した位置）に出す。
+                        # 区切りの行とレポートを会話の記録に残すので、開き直しても同じ位置に出る。
+                        _note = f"{REVIEW_MARK}添削を実行しました（{uploaded_file.name}）"
+                        _body = f"{REVIEW_REPORT_HEAD}\n\n{_report}"
+                        st.session_state.messages += [{"role": "assistant", "content": _note},
+                                                      {"role": "assistant", "content": _body}]
+                        _cid = _ensure_conversation()
+                        add_message(_cid, "assistant", _note)
+                        add_message(_cid, "assistant", _body)
+                        touch_conversation(_cid)
+                        st.session_state.review_result = ""
+                        busy_slot.empty()
+                        st.rerun()
 
         # ── 制度の選択画面に戻る（確認ダイアログ付き） ──
         if st.button("制度の選択画面に戻る", use_container_width=True, key="chat_back"):

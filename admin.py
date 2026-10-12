@@ -20,6 +20,7 @@ from db import (
     get_conversation_counts_by_year,
     get_all_user_stats,
     get_nonempty_conversations_by_user, get_messages_by_conversation,
+    get_ai_event_counts, AI_EVENT_KINDS,
 )
 
 
@@ -872,3 +873,28 @@ def _render_system_info():
             st.info("会話データがありません。")
     except Exception as e:
         st.error(f"取得に失敗しました：{e}")
+
+    _render_ai_limit_counts()
+
+
+def _render_ai_limit_counts():
+    """AIの使用量の上限に当たった回数（直近30日。改善メモ5、2026-10-12〜）。
+    相談は軽いAIに切り替えて答え、添削は少し待って同じAIでやり直す。その回数を相談・添削の別に出す。"""
+    st.markdown("")
+    st.markdown("**AIの混み合い（直近30日）**")
+    st.caption("AIの使用量の上限に当たった回数です。相談は軽いAIに切り替えて回答し、"
+               "添削は少し待って同じAIでやり直します。2026-10-12 から数えています。")
+    try:
+        rows = get_ai_event_counts(30)
+    except Exception as e:
+        st.error(f"取得に失敗しました：{e}")
+        return
+    if not rows:
+        st.success("直近30日、AIの使用量の上限に当たったことはありません。")
+        return
+    n = {(r["app_year"], r["place"], r["kind"]): r["n"] for r in rows}
+    table = []
+    for (place, kind), label in AI_EVENT_KINDS.items():
+        r8, r7 = n.get(("R8", place, kind), 0), n.get(("R7", place, kind), 0)
+        table.append({"場所": place, "起きたこと": label, _year_label("R8"): r8, _year_label("R7"): r7, "合計": r8 + r7})
+    st.dataframe(table, use_container_width=True, hide_index=True)

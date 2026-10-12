@@ -148,7 +148,7 @@ def get_conn():
 # キャッシュはデコレートした関数自身のコードでしか無効化されないため、
 # ここのスキーマだけ変えてもプロセスが生き残っているとマイグレーションが
 # 実行されない。スキーマを変更したら必ずこの値を +1 すること。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def create_tables():
@@ -227,6 +227,18 @@ def create_tables():
                 """CREATE UNIQUE INDEX IF NOT EXISTS idx_users_customer_no
                        ON users (customer_no) WHERE customer_no <> ''"""
             )
+            # AIの使用量の上限に当たったときの出来事（2026-10-12〜）。日時・年度・場所・何が起きたかだけ。
+            # 相談の中身や利用者は記録しない。管理画面の利用統計で直近30日の回数を出す。90日で消す。
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS ai_events (
+                id         SERIAL PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                app_year   TEXT NOT NULL,
+                place      TEXT NOT NULL,
+                kind       TEXT NOT NULL
+            )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ai_events_created ON ai_events(created_at)")
 
 
 # =============================================================
@@ -587,14 +599,59 @@ def touch_conversation(conv_id: int) -> None:
 
 
 def delete_old_conversations(days: int = 90) -> int:
-    """updated_at が days 日以上前の会話を削除（messages は CASCADE で連鎖削除）"""
+    """updated_at が days 日以上前の会話を削除（messages は CASCADE で連鎖削除）。
+    AIの上限の出来事の記録（ai_events）も、同じ日数で消す。"""
     cutoff = (datetime.now(JST) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM conversations WHERE updated_at < %s", (cutoff,)
             )
-            return cur.rowcount
+            n = cur.rowcount
+            cur.execute("DELETE FROM ai_events WHERE created_at < %s", (cutoff,))
+            return n
+
+
+# =============================================================
+# AIの使用量の上限に当たったときの出来事（改善メモ5・7）
+# =============================================================
+# place: 「相談」「添削」
+# kind : 相談 lite_ok   … 上限に当たり、軽いAIに切り替えて答えた
+#        相談 lite_fail … 軽いAIでも上限に当たり、答えられなかった
+#        添削 retry_ok  … 上限に当たり、少し待って同じAIでやり直して添削できた
+#        添削 retry_fail… やり直しても上限に当たり、「少し待ってからもう一度」と案内した
+AI_EVENT_KINDS = {
+    ("相談", "lite_ok"): "軽いAIに切り替えて回答した",
+    ("相談", "lite_fail"): "軽いAIでも回答できなかった",
+    ("添削", "retry_ok"): "少し待ってやり直し、添削できた",
+    ("添削", "retry_fail"): "やり直してもだめで、待つよう案内した",
+}
+
+
+def log_ai_event(place: str, kind: str) -> None:
+    """出来事を1件記録する。記録に失敗しても、相談・添削は止めない（サーバーの記録には残す）。"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_events (created_at, app_year, place, kind) VALUES (%s, %s, %s, %s)",
+                    (_now(), APP_YEAR, place, kind),
+                )
+    except Exception as e:
+        print(f"[ai-limit] warn:log_failed {type(e).__name__}", file=sys.stderr, flush=True)
+
+
+def get_ai_event_counts(days: int = 30) -> list[dict]:
+    """直近 days 日の出来事の回数（年度・場所・種類ごと）。"""
+    cutoff = (datetime.now(JST) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT app_year, place, kind, COUNT(*) AS n FROM ai_events
+                   WHERE created_at >= %s GROUP BY app_year, place, kind""",
+                (cutoff,),
+            )
+            return [dict(r) for r in cur.fetchall()]
 
 
 # =============================================================
