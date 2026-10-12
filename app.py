@@ -1207,6 +1207,80 @@ def _doc_head_text(uploaded_file, limit: int = 400) -> str:
     return ""
 
 
+# =============================================================
+# 同じ制度の別のコースに、同じ番号の様式があるとき（2026-10-12 追加）
+# =============================================================
+# 人材確保等支援助成金の「様式第a-2号 事業所確認票」は、雇用管理制度コースと外国人労働者コースの両方にあり、
+# 中身は別物。番号の照合だけでは取り違えるので、書類の冒頭の文を、それぞれの白紙の様式の冒頭と見比べる。
+#   ・数えるのは「片方の白紙の様式にだけある2文字の並び」が書類に何個あるか（両方に共通の文は数えない）
+#   ・相手の様式の印がはっきり多い（8個以上で、こちらの2倍より多い）ときだけ止める
+#   ・同じ番号の様式が別のコースに無い制度（コースの区分が無い制度・R7 のすべての制度など）では、何もしない
+# 白紙の様式で試すと、正しい書類では相手の印が0個、取り違えた書類では相手の印が33個以上だった。
+_HEAD_COMPARE_LIMIT = 800
+_OTHER_COURSE_MIN_MARKS = 8
+
+
+def _form_no_key(form_name: str):
+    """様式の番号の見分け方。「無期様式第2号」と「継続様式第２号」のように前に付く語が違えば、別の番号として扱う。"""
+    no = _doc_form_no(form_name)
+    return (unicodedata.normalize("NFKC", split_form_title(form_name)[0]), no) if no else None
+
+
+def _same_no_forms_in_other_courses(selected_form: str, cfg: dict, course_key: str) -> dict:
+    """選んだ様式と同じ番号の、ほかのコースの様式 → そのコースの名前。"""
+    k = _form_no_key(selected_form)
+    if not k or not course_key:
+        return {}
+    out = {}
+    for c in domain_courses(cfg):
+        if c.get("key") == course_key:
+            continue
+        for f in c.get("forms") or []:
+            if f != selected_form and _form_no_key(f) == k:
+                out.setdefault(f, c.get("name", ""))
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _template_head(domain_key: str, form_name: str, mtime: str = "") -> str:
+    """白紙の様式（templates の PDF）の冒頭の文字。読めなければ空文字。mtime はキャッシュ無効化用。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "domains", domain_key, "templates", form_name)
+    try:
+        try:
+            import pymupdf as fitz  # 新しい名前
+        except ImportError:
+            import fitz
+        with fitz.open(path) as pdf:
+            return pdf[0].get_text()[:_HEAD_COMPARE_LIMIT] if len(pdf) else ""
+    except Exception:
+        return ""
+
+
+def _bigrams(text: str) -> set:
+    t = re.sub(r"\s", "", unicodedata.normalize("NFKC", text or ""))
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def _other_course_of_doc(uploaded_file, selected_form: str, cfg: dict, domain_key: str, course_key: str) -> str:
+    """書類が、別のコースの同じ番号の様式のようなら、そのコースの名前。そうでなければ空文字。"""
+    others = _same_no_forms_in_other_courses(selected_form, cfg, course_key)
+    if not others or not domain_key:
+        return ""
+    mtime = _domain_mtime(domain_key)
+    own = _bigrams(_template_head(domain_key, selected_form, mtime))
+    if not own:
+        return ""
+    doc = _bigrams(_doc_head_text(uploaded_file, _HEAD_COMPARE_LIMIT))
+    for f, name in others.items():
+        other = _bigrams(_template_head(domain_key, f, mtime))
+        if not other:
+            continue
+        mine, theirs = len(doc & (own - other)), len(doc & (other - own))
+        if theirs >= _OTHER_COURSE_MIN_MARKS and theirs > 2 * mine:
+            return name
+    return ""
+
+
 def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
     want = _doc_form_no(selected_form)
     nos = _doc_form_nos(_doc_head_text(uploaded_file)) if want else []
@@ -1216,6 +1290,15 @@ def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
     if want and nos and want not in nos:
         return (f"アップロードされた書類は「{got}」のようです。選ばれている様式（{want}）とは違うため、"
                 "添削できません。画面で正しい様式を選び直してから、もう一度添削してください。")
+    # 番号は合っていても、同じ番号の別のコースの様式なら止める
+    if want and nos:
+        other_course = _other_course_of_doc(uploaded_file, selected_form, domain_config,
+                                            st.session_state.get("selected_domain_key", ""),
+                                            st.session_state.get("selected_course", ""))
+        if other_course:
+            return (f"アップロードされた書類は、別のコース（{other_course}）の{_form_display(selected_form)}のようです。"
+                    "選ばれているコースの様式とは違うため、添削できません。"
+                    "画面でコースを選び直してから、もう一度添削してください。")
     result = _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
 
     def _again():
