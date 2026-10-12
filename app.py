@@ -2160,6 +2160,35 @@ footer, #MainMenu,
     border-radius: var(--radius-sm) !important;
 }
 
+/* ───────── 添削の欄の文言を日本語で出す（2026-10 担当者決定） ─────────
+   Streamlit にはファイルを選ぶ欄の文言を変える設定が無いので、英語の文字を見えなくして（字の大きさ 0）、
+   同じ大きさ・色で日本語を重ねて出す。左のメニュー（添削モード）の欄だけ。管理画面の Excel の欄は変えない。
+   形式の違うファイル・大きすぎるファイルを選んだときの文（ブラウザの側で出る英語）も、同じやり方で日本語にする。
+   ※「200MB」は Streamlit の決まりの上限。上限を変えたら、ここの文も合わせる。
+   ※ Streamlit を新しくしたときは、部品の名前（data-testid）が変わっていないか確かめる。 */
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] > div > span,
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] > div > small,
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button,
+[data-testid="stSidebar"] [data-testid="stFileUploaderFileErrorMessage"] { font-size: 0 !important; }
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] > div > span::after {
+    content: "ここにファイルを置く"; font-size: 15px; line-height: 24px;
+}
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] > div > small::after {
+    content: "1ファイル200MBまで・PDF, DOCX, XLSX, XLS, XLSM, CSV"; font-size: 14px; line-height: 17.5px;
+}
+[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button::after {
+    content: "ファイルを選ぶ"; font-size: 15px; line-height: 24px;
+}
+[data-testid="stSidebar"] [data-testid="stFileUploaderFileErrorMessage"]::after {
+    content: "このファイルは選べません（PDF・Word・Excel・CSV で 200MB まで）";
+    font-size: 14px; line-height: 1.5;
+}
+/* 選んだファイルの名前・大きさ・誤りの文が、濃紺の面に沈んで読めないので、明るい色にする（2026-10 同時に直す） */
+[data-testid="stSidebar"] [data-testid="stFileUploaderFileName"] { color: #E9EDF3 !important; }
+[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] small { color: #93A3B8 !important; }
+[data-testid="stSidebar"] [data-testid="stFileUploaderFileErrorMessage"] { color: #F4A7AB !important; }
+[data-testid="stSidebar"] [data-testid="stFileUploaderDeleteBtn"] button { color: #E9EDF3 !important; }
+
 /* ───────── スマートフォンの幅だけの調整（2026-10 スマートフォン対応） ─────────
    方針：スマートフォンで「できない」と言われない最低限。パソコン（幅 769px 以上）の見た目と動きは変えない。
    Streamlit は幅 768px 以下で上の帯（左上のメニューのボタン）を出し、640px 以下で列を縦に並べる。
