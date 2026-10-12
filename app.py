@@ -1224,6 +1224,13 @@ def review_document(uploaded_file, selected_form, form_map, rules_and_cases):
     return result
 
 
+# 添削のAIの設定（改善メモ6・2026-10-12 担当者決定「案B」）。答えのばらつきを0にし、乱数の種を固定して、
+# 同じ書類なら毎回同じ添削になるようにする。試験（3つの書類×5回）で、必ず出るべき指摘をすべて出し、5回とも同じ答えだった。
+# 気をつけること：間違えるときは毎回同じように間違える／Google 側でAIが新しくなると答えが変わることがある。
+# 相談（質問への回答）の設定は変えない（ここは添削だけ）。
+REVIEW_GEN_SETTINGS = {"temperature": 0, "seed": 42}
+
+
 def _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases):
     file_name      = uploaded_file.name.lower()
     stage          = get_stage_for_form(selected_form, domain_config)
@@ -1246,7 +1253,7 @@ def _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
                 types.Part(inline_data=types.Blob(mime_type="application/pdf", data=pdf_bytes)),
                 types.Part(text=pdf_instruction),
             ])],
-            config=types.GenerateContentConfig(system_instruction=review_sys),
+            config=types.GenerateContentConfig(system_instruction=review_sys, **REVIEW_GEN_SETTINGS),
         )
         return response.text
 
@@ -1277,7 +1284,7 @@ def _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=f"以下のWord文書を添削してください：{notice}\n\n{text}",
-            config=types.GenerateContentConfig(system_instruction=review_sys),
+            config=types.GenerateContentConfig(system_instruction=review_sys, **REVIEW_GEN_SETTINGS),
         )
         return response.text
 
@@ -1302,7 +1309,7 @@ def _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=f"以下のExcelシートを添削してください：\n\n{excel_text}",
-            config=types.GenerateContentConfig(system_instruction=review_sys),
+            config=types.GenerateContentConfig(system_instruction=review_sys, **REVIEW_GEN_SETTINGS),
         )
         return response.text
 
@@ -1330,7 +1337,7 @@ def _review_document_ai(uploaded_file, selected_form, form_map, rules_and_cases)
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=f"以下のCSVデータを添削してください：\n\n{csv_text}",
-            config=types.GenerateContentConfig(system_instruction=review_sys),
+            config=types.GenerateContentConfig(system_instruction=review_sys, **REVIEW_GEN_SETTINGS),
         )
         return response.text
 
