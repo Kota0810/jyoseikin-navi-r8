@@ -284,6 +284,56 @@ st.set_page_config(
     page_icon="🛡️",
 )
 
+
+def _mark_page_notranslate():
+    """Chrome の自動翻訳で画面の日本語が書き換わらないよう、最初に読むページ（index.html）に
+    「翻訳しない」の印（<meta name="google" content="notranslate"> と <html translate="no">）を入れる（2026-10-29）。
+    Streamlit の index.html は <html lang="en"> のため、Chrome が英語のページと思って翻訳を勧める。
+    ・部品（.venv）は試験用の入口と共用なので、ファイルは書き換えない。このアプリの中で返すときだけ印を足す
+    ・このプロセスで最初の利用者の画面が動いた後から効く（再起動直後の最初の1回の読み込みには付かない）
+    ・Streamlit の作りが変わって差し替えられないときは、何もせずに記録だけ残す（画面はこれまでどおり）"""
+    try:
+        from streamlit.web.server import routes
+        handler = routes.StaticFileHandler
+        if getattr(handler, "_jyo_notranslate", False):
+            return
+        base_get_content = handler.get_content.__func__
+        base_get_size = handler.get_content_size
+
+        def is_index(path):
+            return (os.path.basename(path) == "index.html"
+                    and os.path.basename(os.path.dirname(path)) == "static")
+
+        def marked(path):
+            data = b"".join(base_get_content(handler, path))
+            if b'name="google"' in data:
+                return data
+            return (data.replace(b'<html lang="en">', b'<html lang="en" translate="no">', 1)
+                        .replace(b"<head>", b'<head>\n    <meta name="google" content="notranslate" />', 1))
+
+        def get_content(cls, abspath, start=None, end=None):
+            if is_index(abspath):
+                return marked(abspath)[start:end]
+            return base_get_content(cls, abspath, start, end)
+
+        def get_content_size(self):
+            if is_index(self.absolute_path):
+                return len(marked(self.absolute_path))
+            return base_get_size(self)
+
+        handler.get_content = classmethod(get_content)
+        handler.get_content_size = get_content_size
+        handler._jyo_notranslate = True
+        # ページの見分け札（ETag）は覚えた値を使い回すため、印のない古いページを持っている画面に
+        # 「変わっていない」と返してしまう。覚えた値を捨てて、印つきの中身で作り直させる
+        with handler._lock:
+            handler._static_hashes.clear()
+    except Exception as e:
+        print(f"[notranslate] skip {type(e).__name__}", flush=True)
+
+
+_mark_page_notranslate()
+
 load_dotenv()
 # ローカル: .env から取得 / Streamlit Cloud: st.secrets から取得
 try:
