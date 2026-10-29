@@ -287,8 +287,10 @@ st.set_page_config(
 
 def _mark_page_notranslate():
     """Chrome の自動翻訳で画面の日本語が書き換わらないよう、最初に読むページ（index.html）に
-    「翻訳しない」の印（<meta name="google" content="notranslate"> と <html translate="no">）を入れる（2026-10-29）。
-    Streamlit の index.html は <html lang="en"> のため、Chrome が英語のページと思って翻訳を勧める。
+    「翻訳しない」の印（<meta name="google" content="notranslate"> と <html translate="no">）を入れ、
+    ページの言葉の名乗りを日本語（<html lang="ja">）に直す（2026-10-29）。
+    Streamlit の index.html は <html lang="en"> のため、Chrome が英語のページと思って翻訳を勧め、
+    右クリックの「日本語に翻訳」では、印があっても日本語を英語として訳して書き換えてしまう（試験で確認）。
     ・部品（.venv）は試験用の入口と共用なので、ファイルは書き換えない。このアプリの中で返すときだけ印を足す
     ・このプロセスで最初の利用者の画面が動いた後から効く（再起動直後の最初の1回の読み込みには付かない）
     ・Streamlit の作りが変わって差し替えられないときは、何もせずに記録だけ残す（画面はこれまでどおり）"""
@@ -308,7 +310,7 @@ def _mark_page_notranslate():
             data = b"".join(base_get_content(handler, path))
             if b'name="google"' in data:
                 return data
-            return (data.replace(b'<html lang="en">', b'<html lang="en" translate="no">', 1)
+            return (data.replace(b'<html lang="en">', b'<html lang="ja" translate="no">', 1)
                         .replace(b"<head>", b'<head>\n    <meta name="google" content="notranslate" />', 1))
 
         def get_content(cls, abspath, start=None, end=None):
