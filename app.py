@@ -1658,6 +1658,13 @@ def _is_billing_error(e) -> bool:
     return _err_code(e) == 402 or "prepayment credits" in str(e or "")
 
 
+def _is_unavailable_error(e) -> bool:
+    """AI 側が、このサーバーからの利用そのものを断っているエラーか（「使っている場所が対応外」など。400 FAILED_PRECONDITION）。
+    待っても軽いAIでも通らない（2026-11-19 朝、サーバーの IPv4 の住所が対応外と見なされ、R8 の相談・添削がすべて断られた）。"""
+    s = str(e or "")
+    return "FAILED_PRECONDITION" in s or "location is not supported" in s
+
+
 def _is_quota_error(e) -> bool:
     """AIの使用量の上限に当たったエラーか（429 / RESOURCE_EXHAUSTED。残高切れの 402 は含めない）。"""
     if _is_billing_error(e):
@@ -1688,6 +1695,8 @@ def _record_ai_limit(place: str, kind: str, model: str) -> None:
 CHAT_RETRY_MSG = "⏳ 混み合っているため、別のAIで答え直しています。少しお待ちください。"
 CHAT_BUSY_MSG = "混み合っていて、回答を作れませんでした。1〜2分ほどおいて、もう一度送ってください。"
 CHAT_ERROR_MSG = "回答を作れませんでした。少しおいて、もう一度送ってください。"
+# AI そのものが使えないとき（場所が対応外・前払いの残高切れ）の案内。送り直しても通らないので、待ってもらう（2026-11-19）
+AI_UNAVAILABLE_MSG = "現在AIの回答機能が使えません。復旧までお待ちください。"
 CHAT_AGAIN_MSG = "⏳ うまく回答を作れなかったため、もう一度試しています。少しお待ちください。"
 CHAT_WAIT_MSG = "⏳ 混み合っているため、{sec}秒ほど待ってから、もう一度試しています。少しお待ちください。"
 CHAT_ANSWERING_NOTE = "回答を作成しています。終わるまで、入力欄と記入項目は押せません。"
@@ -1820,7 +1829,10 @@ def send_and_stream(prompt: str) -> bool:
         if _is_quota_error(last_error):   # 上限のまま終わるのは、3回目までやり直したときだけ
             _record_ai_limit("相談", "retry_fail", model_name)
         print(f"[chat] error {type(last_error).__name__}: {str(last_error).strip()[:200]}", file=sys.stderr, flush=True)
-        _msg = CHAT_BUSY_MSG if _is_quota_error(last_error) else CHAT_ERROR_MSG
+        if _is_unavailable_error(last_error) or _is_billing_error(last_error):
+            _msg = AI_UNAVAILABLE_MSG
+        else:
+            _msg = CHAT_BUSY_MSG if _is_quota_error(last_error) else CHAT_ERROR_MSG
         st.session_state.last_error = _msg   # 画面を作り直したあとに、同じ分かる言葉で出す（英語のエラーは出さない）
         return False
 
@@ -3054,7 +3066,7 @@ elif st.session_state.app_state == "chat":
                         "</div></div>",
                         unsafe_allow_html=True,
                     )
-                    _failed = False
+                    _failed, _fail_err = False, None
                     try:
                         _report = review_with_retry(
                             uploaded_file, st.session_state.selected_form,
@@ -3063,10 +3075,12 @@ elif st.session_state.app_state == "chat":
                     except Exception as _e:
                         # 上限以外のエラー。本当の理由はサーバーの記録に残し、画面には分かる言葉で出す
                         print(f"[review] error {type(_e).__name__}: {str(_e).strip()[:200]}", file=sys.stderr, flush=True)
-                        _report, _failed = None, True
+                        _report, _failed, _fail_err = None, True, _e
                     if _report is None:
                         busy_slot.empty()   # 「添削しています」を残さない
-                        if _failed:
+                        if _failed and (_is_unavailable_error(_fail_err) or _is_billing_error(_fail_err)):
+                            st.error(AI_UNAVAILABLE_MSG)
+                        elif _failed:
                             st.error("添削を完了できませんでした。少しおいて、もう一度「添削を実行」を押してください。")
                         else:
                             st.warning(REVIEW_BUSY_MSG)
