@@ -625,6 +625,8 @@ AI_EVENT_KINDS = {
     ("相談", "lite_fail"): "軽いAIでも回答できなかった",
     ("添削", "retry_ok"): "少し待ってやり直し、添削できた",
     ("添削", "retry_fail"): "やり直してもだめで、待つよう案内した",
+    ("相談", "retry_ok"): "軽いAIでもだめで、少し待ってやり直し、回答した",
+    ("相談", "retry_fail"): "少し待ってやり直してもだめで、待つよう案内した",
 }
 
 
@@ -666,6 +668,14 @@ def add_message(conv_id: int, role: str, content: str) -> int:
                 (conv_id, role, content, _now()),
             )
             return cur.fetchone()["id"]
+
+
+def delete_message(conv_id: int, msg_id: int) -> None:
+    """送るのに失敗した質問を、会話の記録から消す（返事のない質問を記録に残さない。2026-11-19）。
+    消すのは、その会話の、その1件だけ。"""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM messages WHERE id = %s AND conversation_id = %s", (msg_id, conv_id))
 
 
 def get_messages_by_conversation(conv_id: int) -> list[dict]:

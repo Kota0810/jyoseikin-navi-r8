@@ -11,7 +11,7 @@ from google.genai import Client, types
 from dotenv import load_dotenv
 from db import (
     create_tables, SCHEMA_VERSION,
-    create_conversation, add_message, touch_conversation,
+    create_conversation, add_message, delete_message, touch_conversation,
     update_conversation_title, update_conversation_form,
     get_conversations_by_user, get_messages_by_conversation, get_conversation,
     log_ai_event,
@@ -151,9 +151,10 @@ def section_label(text: str) -> None:
 # 様式名の整え方・区切りの行・太字の表示は display_text.py（管理画面と共用）
 
 
-def _render_item_buttons(form_items: list, prefix: str) -> None:
+def _render_item_buttons(form_items: list, prefix: str, disabled: bool = False) -> None:
     """記入項目のボタンの並び。右の列（prefix="ri"）と、スマートフォンの一覧（prefix="rp"）で同じものを出す。
-    押すと、その欄についての質問を送る（pending_item に入れて画面を作り直す。一覧のダイアログもこれで閉じる）。"""
+    押すと、その欄についての質問を送る（pending_item に入れて画面を作り直す。一覧のダイアログもこれで閉じる）。
+    disabled のとき（返事を待っているあいだ）は押せない形で出す。"""
     _prev_group = None
     for _group, _chip, _label, item, i in build_item_rows(form_items):
         # グループが変わったところにだけ見出しを差し込む
@@ -168,7 +169,7 @@ def _render_item_buttons(form_items: list, prefix: str) -> None:
         # 3行に収まらず「…」で切れる長い名前は、マウスを当てると全文が出るようにする
         _full = f"{_group} {_label}" if _group else _label
         _help = _full if len(_full) > 40 else None
-        if st.button(btn_label, key=f"{prefix}-{i}", use_container_width=True, help=_help):
+        if st.button(btn_label, key=f"{prefix}-{i}", use_container_width=True, help=_help, disabled=disabled) and not disabled:
             if prefix == "rp":
                 # スマートフォンの一覧（ダイアログ）から選んだとき：まず一覧を閉じる画面を1回作り切り、
                 # 質問はその次の画面で送る（そのまま送ると、回答ができるまで薄い一覧が残るため。2026-10-12）
@@ -206,6 +207,40 @@ def _ensure_conversation() -> int:
     return conv_id
 
 
+def _start_answer(prompt: str, from_input: bool = False) -> None:
+    """質問を会話に足して記録し、「返事を待っている」状態にして画面を作り直す（2026-11-19）。
+    AI へは、次の画面で入力欄・記入項目などを押せない形で作り切ってから、画面の最後で送る（answering）。
+    以前はボタンを押した画面のまま送っていたため、返事が来る前に次の欄を押せてしまい、そのたびに
+    作りかけの返事が消え、返事のない質問が会話に続けて残っていた。
+    質問はすぐ記録に残す（入れ替えの前の「回答を作っている最中の質問」の確かめがこれを数える）。
+    失敗したら、記録と画面から消す（_finish_answer）。"""
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    conv_id = _ensure_conversation()
+    msg_id = add_message(conv_id, "user", prompt)
+    st.session_state.answering = {"prompt": prompt, "conv_id": conv_id, "msg_id": msg_id, "from_input": from_input}
+    st.session_state.last_error = ""
+    st.rerun()
+
+
+def _finish_answer(job: dict, ok: bool) -> None:
+    """返事を待っている状態を終える。失敗した質問は、会話（画面とAIに渡す履歴）と記録から消す。
+    入力欄から送った質問は、書き直さずに送り直せるよう入力欄に戻す。"""
+    st.session_state.answering = None
+    if ok:
+        return
+    msgs = st.session_state.messages
+    if msgs and msgs[-1].get("role") == "user" and msgs[-1].get("content") == job["prompt"]:
+        msgs.pop()
+    try:
+        delete_message(job["conv_id"], job["msg_id"])
+    except Exception as e:
+        print(f"[chat] delete_failed {type(e).__name__}", file=sys.stderr, flush=True)
+    if job.get("from_input"):
+        st.session_state.restore_input = job["prompt"]
+    else:
+        st.session_state.last_error += f"\n\n送れなかった質問：{job['prompt']}"
+
+
 def _switch_form(new_form: str) -> None:
     """相談はそのまま、様式だけを切り替える（AI に渡す項目・右の記入項目・添削の基準が変わる）。"""
     old = st.session_state.get("selected_form", "")
@@ -230,7 +265,7 @@ def _on_form_switch(widget_key: str) -> None:
     _switch_form(st.session_state.get(widget_key, ""))
 
 
-def _render_form_switcher(form_map: dict, domain_config: dict, where: str = "top") -> None:
+def _render_form_switcher(form_map: dict, domain_config: dict, where: str = "top", disabled: bool = False) -> None:
     """「切り替える」ボタン。押すと、同じ制度・同じコースの様式と「全般」の一覧が出る。
     様式名の横（top）と、入力欄のすぐ上の帯（bottom）の2か所に置く。"""
     order = domain_config.get("form_order", [])
@@ -241,7 +276,7 @@ def _render_form_switcher(form_map: dict, domain_config: dict, where: str = "top
         options.insert(0, current)
     key = f"form_switch_{where}_{st.session_state.get('current_conv_id')}_{current}"
     label = "⇄ 様式を切り替える" if where == "top" else "⇄ 切り替える"
-    with st.popover(label, use_container_width=True):
+    with st.popover(label, use_container_width=True, disabled=disabled):
         st.caption("同じコースの様式から選び直します。この相談のまま続けられます。")
         st.radio(
             "様式", options, index=options.index(current),
@@ -1509,8 +1544,12 @@ MAX_HISTORY_MESSAGES = 20  # 直近10往復（user + assistant 各10件）
 def build_gemini_contents(messages: list, current_prompt: str) -> list:
     contents = []
     history = messages[:-1][-MAX_HISTORY_MESSAGES:]  # 直近10往復に制限
-    for m in history:
+    for i, m in enumerate(history):
         role = "user" if m["role"] == "user" else "model"
+        # 返事のない質問（送るのに失敗した・途中で切れた質問。以前の記録に残っている）は送らない。
+        # 質問が続けて並ぶと、AI に断られたり、前の質問にまとめて答えたりするため（2026-11-19）
+        if role == "user" and (i + 1 >= len(history) or history[i + 1]["role"] == "user"):
+            continue
         # 切り替えの区切りの行は AI 側の行として残る。同じ話し手が続く・先頭が AI 側になるのを避ける
         if not contents and role == "model":
             continue
@@ -1609,10 +1648,34 @@ def _regenerate_chat(model_name, contents, system_prompt) -> str:
 MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
 
+def _err_code(e):
+    c = getattr(e, "code", None)
+    return c if isinstance(c, int) else None
+
+
+def _is_billing_error(e) -> bool:
+    """AIの前払いの残高が尽きたエラーか（402）。混み合いではないので、待っても軽いAIでも通らない（2026-11-19）。"""
+    return _err_code(e) == 402 or "prepayment credits" in str(e or "")
+
+
 def _is_quota_error(e) -> bool:
-    """AIの使用量の上限に当たったエラーか（429 / RESOURCE_EXHAUSTED）。"""
+    """AIの使用量の上限に当たったエラーか（429 / RESOURCE_EXHAUSTED。残高切れの 402 は含めない）。"""
+    if _is_billing_error(e):
+        return False
     s = str(e or "")
     return "429" in s or "RESOURCE_EXHAUSTED" in s
+
+
+def _is_transient_error(e) -> bool:
+    """少し待てば通りそうな一時的な失敗か（AI側の混雑・不調の 500/502/503/504、時間切れ、つながりの切れ。2026-11-19）。"""
+    if _err_code(e) in (500, 502, 503, 504):
+        return True
+    if any(k in str(e or "") for k in ("UNAVAILABLE", "DEADLINE_EXCEEDED")):
+        return True
+    # 時間切れ・つながりの切れは、AI の部品の版によって使う通信の部品が違うので、エラーの種類の名前で見分ける
+    names = {c.__name__ for c in type(e).__mro__}
+    return bool(names & {"TimeoutError", "ConnectionError", "TimeoutException", "TransportError",
+                         "Timeout", "ClientConnectionError"})
 
 
 def _record_ai_limit(place: str, kind: str, model: str) -> None:
@@ -1625,6 +1688,16 @@ def _record_ai_limit(place: str, kind: str, model: str) -> None:
 CHAT_RETRY_MSG = "⏳ 混み合っているため、別のAIで答え直しています。少しお待ちください。"
 CHAT_BUSY_MSG = "混み合っていて、回答を作れませんでした。1〜2分ほどおいて、もう一度送ってください。"
 CHAT_ERROR_MSG = "回答を作れませんでした。少しおいて、もう一度送ってください。"
+CHAT_AGAIN_MSG = "⏳ うまく回答を作れなかったため、もう一度試しています。少しお待ちください。"
+CHAT_WAIT_MSG = "⏳ 混み合っているため、{sec}秒ほど待ってから、もう一度試しています。少しお待ちください。"
+CHAT_ANSWERING_NOTE = "回答を作成しています。終わるまで、入力欄と記入項目は押せません。"
+
+# 相談のAIの試し方（2026-11-19：一時的な失敗も自動でやり直す。やり直しは2回まで）。
+#   1回目 2.5-flash → 上限なら すぐ、一時的な失敗なら CHAT_AGAIN_WAIT 秒待って、2回目 2.5-flash-lite
+#   → それも上限・一時的な失敗なら、CHAT_RETRY_WAIT 秒待って 3回目 2.5-flash。それ以外の失敗（書き方の誤りなど）はやり直さない
+CHAT_AGAIN_WAIT = int(os.getenv("JYO_CHAT_AGAIN_WAIT", "2"))
+CHAT_RETRY_WAIT = int(os.getenv("JYO_CHAT_RETRY_WAIT", "10"))
+CHAT_ATTEMPTS = [MODELS[0], MODELS[1], MODELS[0]]
 
 # 添削が上限に当たったときに、同じAIでやり直すまで待つ秒数（改善メモ7：1回だけ自動でやり直す）
 REVIEW_RETRY_WAIT = int(os.getenv("JYO_REVIEW_RETRY_WAIT", "20"))
@@ -1667,7 +1740,8 @@ def review_with_retry(uploaded_file, selected_form, form_map, rules_and_cases, b
     return result
 
 def send_and_stream(prompt: str) -> bool:
-    """ユーザーの質問を処理してストリーミング応答を返す共通関数。成功時True"""
+    """ユーザーの質問を処理してストリーミング応答を返す共通関数。成功時True。
+    失敗したときは分かる言葉を last_error に入れて False を返す（画面の作り直しと、失敗した質問の始末は呼ぶ側）。"""
     stage           = get_stage_for_form(st.session_state.selected_form, domain_config)
     filtered_rules  = filter_rules_by_stage(rules_and_cases, stage)
     relevant_chunks = get_relevant_chunks(prompt, pdf_chunks)
@@ -1682,12 +1756,29 @@ def send_and_stream(prompt: str) -> bool:
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
+        placeholder.markdown("回答を作成しています…")
         full = ""
 
-        # モデルを順に試行（2.5-flash → 2.5-flash-lite フォールバック）
+        # AI を順に試す（CHAT_ATTEMPTS：2.5-flash → 2.5-flash-lite → 少し待って 2.5-flash）
         last_error = None
-        hit_limit = False   # 上限に当たって軽いAIに切り替えたか（改善メモ5：回数を記録する）
-        for model_name in MODELS:
+        hit_limit = False   # 上限に当たったか（改善メモ5：回数を記録する）
+        for n, model_name in enumerate(CHAT_ATTEMPTS):
+            if n:
+                quota = _is_quota_error(last_error)
+                # やり直して通りそうな失敗（上限・一時的な失敗）でなければ、やり直さない
+                if not (quota or _is_transient_error(last_error)):
+                    break
+                if n == 1:
+                    placeholder.markdown(CHAT_RETRY_MSG if quota else CHAT_AGAIN_MSG)
+                    if not quota:
+                        time.sleep(CHAT_AGAIN_WAIT)
+                else:
+                    if quota:
+                        _record_ai_limit("相談", "lite_fail", CHAT_ATTEMPTS[n - 1])
+                    placeholder.markdown(CHAT_WAIT_MSG.format(sec=CHAT_RETRY_WAIT))
+                    time.sleep(CHAT_RETRY_WAIT)
+                print(f"[chat] retry {n} model={model_name} after {type(last_error).__name__}: "
+                      f"{str(last_error).strip()[:120]}", file=sys.stderr, flush=True)
             full = ""
             try:
                 for chunk in client.models.generate_content_stream(
@@ -1711,7 +1802,7 @@ def send_and_stream(prompt: str) -> bool:
                     full, lambda: _regenerate_chat(model_name, gemini_contents, system_prompt), "相談")
                 placeholder.markdown(_md(full) or "（回答を生成できませんでした）")
                 if hit_limit:
-                    _record_ai_limit("相談", "lite_ok", model_name)
+                    _record_ai_limit("相談", "lite_ok" if n == 1 else "retry_ok", model_name)
                 if full:
                     st.session_state.messages.append({"role": "assistant", "content": full})
                     # DB に AI 応答を保存
@@ -1722,22 +1813,15 @@ def send_and_stream(prompt: str) -> bool:
                 return True
             except Exception as e:
                 last_error = e
-                err_str = str(e)
-                # レート制限エラーの場合は次のモデルで再試行
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if _is_quota_error(e):
                     hit_limit = True
-                    placeholder.markdown(CHAT_RETRY_MSG)
-                    continue
-                # レート制限以外のエラーはそのまま表示
-                break
 
         placeholder.empty()
-        if hit_limit and _is_quota_error(last_error):
-            _record_ai_limit("相談", "lite_fail", MODELS[-1])
+        if _is_quota_error(last_error):   # 上限のまま終わるのは、3回目までやり直したときだけ
+            _record_ai_limit("相談", "retry_fail", model_name)
         print(f"[chat] error {type(last_error).__name__}: {str(last_error).strip()[:200]}", file=sys.stderr, flush=True)
         _msg = CHAT_BUSY_MSG if _is_quota_error(last_error) else CHAT_ERROR_MSG
-        st.warning(_msg)
-        st.session_state.last_error = _msg   # 画面を作り直したあとも、同じ分かる言葉で出す（英語のエラーは出さない）
+        st.session_state.last_error = _msg   # 画面を作り直したあとに、同じ分かる言葉で出す（英語のエラーは出さない）
         return False
 
 
@@ -2572,6 +2656,8 @@ _defaults = {
     "pending_prompt":      "",
     "input_key":           0,
     "last_error":          "",
+    "answering":           None,   # 返事を待っている質問（_start_answer。2026-11-19）
+    "restore_input":       "",     # 送れなかった質問を入力欄に戻すときの中身
     "sso_error":           "",
     "sso_return_url":      "",
 }
@@ -2907,6 +2993,13 @@ elif st.session_state.app_state == "setup":
 elif st.session_state.app_state == "chat":
     require_login()
 
+    # 返事を待っている質問があるか（2026-11-19）。あれば、この画面ではボタン・入力欄を押せない形で作り、
+    # 画面の最後で AI に送る。別の会話に移っていたら（途中で切れたときの名残り）、送らずに捨てる
+    _job = st.session_state.get("answering")
+    if _job and _job.get("conv_id") != st.session_state.get("current_conv_id"):
+        st.session_state.answering = _job = None
+    _busy = bool(_job)
+
     # 添削中の表示を出すための置き場。
     # ★ 本文側に作ること。サイドバーの中に作ると、サイドバーに transform が
     #   掛かっているため position: fixed がサイドバー基準になり、画面全体を
@@ -2923,11 +3016,11 @@ elif st.session_state.app_state == "chat":
 
         # ── ユーザー情報・ログアウト ──
         render_sidebar_user(st.session_state.display_name)
-        if st.button("ログアウト", use_container_width=True, key="chat_logout"):
+        if st.button("ログアウト", use_container_width=True, key="chat_logout", disabled=_busy):
             logout()
             st.rerun()
         if st.session_state.is_admin:
-            if st.button("管理画面へ", use_container_width=True, key="chat_admin"):
+            if st.button("管理画面へ", use_container_width=True, key="chat_admin", disabled=_busy):
                 st.session_state.app_state = "admin"
                 st.rerun()
 
@@ -2945,10 +3038,11 @@ elif st.session_state.app_state == "chat":
             )
             uploaded_file = st.file_uploader(
                 "申請書類", type=["pdf", "docx", "xlsx", "xls", "xlsm", "csv"], label_visibility="collapsed",
+                disabled=_busy,
             )
             if uploaded_file:
                 st.caption(uploaded_file.name)
-                if st.button("添削を実行", type="primary", use_container_width=True, key="review_run"):
+                if st.button("添削を実行", type="primary", use_container_width=True, key="review_run", disabled=_busy):
                     # 待ち時間が長いので、サイドバーのスピナーではなく
                     # 画面全体に出す。書き出しは処理を始める前に送る。
                     busy_slot.markdown(
@@ -2992,20 +3086,20 @@ elif st.session_state.app_state == "chat":
                         st.rerun()
 
         # ── 制度の選択画面に戻る（確認ダイアログ付き） ──
-        if st.button("制度の選択画面に戻る", use_container_width=True, key="chat_back"):
+        if st.button("制度の選択画面に戻る", use_container_width=True, key="chat_back", disabled=_busy):
             confirm_reset_dialog()
 
         # ── 様式を画像で表示する ──
         template_path = get_template_path(st.session_state.selected_form)
         if template_path:
-            if st.button("様式を画像で表示", use_container_width=True, key="chat_template"):
+            if st.button("様式を画像で表示", use_container_width=True, key="chat_template", disabled=_busy):
                 show_template_dialog(template_path)
 
         st.divider()
 
         # ── 過去の会話スレッド一覧 ──
         section_label("過去の会話")
-        if st.button("新しい会話を始める", use_container_width=True, type="primary", key="chat_new"):
+        if st.button("新しい会話を始める", use_container_width=True, type="primary", key="chat_new", disabled=_busy):
             st.session_state.app_state = "setup"
             st.session_state.current_conv_id = None
             st.session_state.messages = []
@@ -3021,7 +3115,7 @@ elif st.session_state.app_state == "chat":
             _label = _conv_label(_conv)
             _caption = _conv["updated_at"][:10] if _conv.get("updated_at") else ""
             if st.button(_label, key=f"conv_{_conv['id']}", use_container_width=True,
-                         help=_caption, disabled=_is_current):
+                         help=_caption, disabled=_is_current or _busy):
                 # 過去スレッドを選択して復元
                 _msgs = get_messages_by_conversation(_conv["id"])
                 st.session_state.messages        = [{"role": m["role"], "content": m["content"]} for m in _msgs]
@@ -3054,7 +3148,7 @@ elif st.session_state.app_state == "chat":
     # ── スマートフォンの幅だけ：右上の「記入項目」のボタン（押すと一覧のダイアログが開く）──
     if form_items:
         with st.container(key="items_fab"):
-            if st.button("記入項目", key="items_fab_btn"):
+            if st.button("記入項目", key="items_fab_btn", disabled=_busy):
                 _items_dialog(form_items)
 
     # ── メインカラム ──────────────────────────────────────────
@@ -3075,7 +3169,7 @@ elif st.session_state.app_state == "chat":
                     unsafe_allow_html=True,
                 )
             with _c_switch:
-                _render_form_switcher(form_map, domain_config)
+                _render_form_switcher(form_map, domain_config, disabled=_busy)
             st.markdown(
                 "<div class='ctx-meta'>"
                 + f"<span class='ctx-domain'>{html.escape(st.session_state.selected_grant)}</span>"
@@ -3088,11 +3182,6 @@ elif st.session_state.app_state == "chat":
                 + "</div>",
                 unsafe_allow_html=True,
             )
-
-        # ── 前回のエラー表示 ──────────────────────────────────
-        if st.session_state.last_error:
-            st.warning(st.session_state.last_error)
-            st.session_state.last_error = ""
 
         # ── チャット履歴の表示 ────────────────────────────────
         if st.session_state.messages:
@@ -3151,17 +3240,16 @@ elif st.session_state.app_state == "chat":
             _auto_prompt = st.session_state.pending_prompt
             st.session_state.pending_prompt = ""
 
-        if _auto_prompt:
-            st.session_state.messages.append({"role": "user", "content": _auto_prompt})
-            # DB にユーザーメッセージを保存（会話の記録がまだ無ければ、ここで作る）
-            conv_id = _ensure_conversation()
-            add_message(conv_id, "user", _auto_prompt)
-            with st.chat_message("user"):
-                st.markdown(_auto_prompt)
+        # 返事はここ（会話のいちばん下）に出す。AI へは、画面のほかの所を押せない形で作り切ってから送る（画面の最後）
+        _answer_slot = st.container()
 
-            success = send_and_stream(_auto_prompt)
-            if success:
-                st.rerun()
+        # ── 前回のエラー表示（送れなかったときの案内。会話のいちばん下に出す）──
+        if st.session_state.last_error and not _busy:
+            st.warning(st.session_state.last_error)
+            st.session_state.last_error = ""
+
+        if _auto_prompt and not _busy:
+            _start_answer(_auto_prompt)
 
         # ── 入力欄のすぐ上の帯（いまの様式＋切り替える）──────
         # 会話が長くなっても、上まで戻らずに様式を確かめて切り替えられるようにする
@@ -3174,7 +3262,7 @@ elif st.session_state.app_state == "chat":
                     unsafe_allow_html=True,
                 )
             with _fs_r:
-                _render_form_switcher(form_map, domain_config, where="bottom")
+                _render_form_switcher(form_map, domain_config, where="bottom", disabled=_busy)
 
         # ── スマートフォンの幅だけ：どこから開けるかの一言 ──
         with st.container(key="phone_hint"):
@@ -3182,30 +3270,31 @@ elif st.session_state.app_state == "chat":
                        + ("、記入項目は右上の「記入項目」" if form_items else "") + "から開けます。")
 
         # ── 入力欄（コンポーザー）────────────────────────────
+        _input_key = f"user_input_{st.session_state.input_key}"
+        if st.session_state.restore_input and not _busy:
+            # 送れなかった質問を、書き直さずに送り直せるよう入力欄に戻す
+            st.session_state[_input_key] = st.session_state.restore_input
+            st.session_state.restore_input = ""
         with st.container(key="composer"):
             user_input = st.text_area(
                 "入力欄",
-                placeholder="例：離職率の計算方法は？ / ③(1)欄には何を書く？",
+                placeholder=(CHAT_ANSWERING_NOTE if _busy else "例：離職率の計算方法は？ / ③(1)欄には何を書く？"),
                 height=112,
                 label_visibility="collapsed",
-                key=f"user_input_{st.session_state.input_key}",
+                key=_input_key,
+                disabled=_busy,
             )
             _cl, _cr = st.columns([3, 1])
+            with _cl:
+                if _busy:
+                    st.caption("⏳ " + CHAT_ANSWERING_NOTE)
             with _cr:
-                submit = st.button("送信", use_container_width=True, type="primary", key="composer_send")
+                submit = st.button("送信", use_container_width=True, type="primary", key="composer_send",
+                                   disabled=_busy)
 
-        if submit and user_input.strip():
-            prompt = user_input.strip()
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            # DB にユーザーメッセージを保存（会話の記録がまだ無ければ、ここで作る）
-            conv_id = _ensure_conversation()
-            add_message(conv_id, "user", prompt)
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            success = send_and_stream(prompt)
-            if success:
-                st.session_state.input_key += 1
-                st.rerun()
+        if submit and user_input.strip() and not _busy:
+            st.session_state.input_key += 1   # 入力欄を空にする
+            _start_answer(user_input.strip(), from_input=True)
 
     # ── 右カラム（記入項目・固定風） ─────────────────────────
     if col_right is not None:
@@ -3214,11 +3303,12 @@ elif st.session_state.app_state == "chat":
             # [data-testid="stColumn"]:has(.right-col-header) として右カラムを特定する）
             st.markdown(
                 "<div class='right-col-header'>記入項目</div>"
-                "<p class='right-col-sub'>選ぶと、その欄についての質問を送信します。</p>",
+                + ("<p class='right-col-sub'>回答を作成しています。終わるまで選べません。</p>" if _busy else
+                   "<p class='right-col-sub'>選ぶと、その欄についての質問を送信します。</p>"),
                 unsafe_allow_html=True,
             )
 
-            _render_item_buttons(form_items, "ri")
+            _render_item_buttons(form_items, "ri", disabled=_busy)
 
     # 一覧から選んだ欄の質問を、この画面を作り切ってから（＝一覧が閉じてから）送る。
     # 画面を作り切る前に作り直すと薄い一覧が残るので、0.5秒ごとに動く小さな部品で、作り切ったあとに作り直す
@@ -3233,6 +3323,20 @@ elif st.session_state.app_state == "chat":
             st.session_state["_send_tick"] = True
 
         _send_after_close_tick()
+
+    # 返事を待っている質問を、ここで AI に送る（2026-11-19）。ほかのボタン・入力欄は押せない形で作り切ってあるので、
+    # 返事の途中で次の質問を押して、作りかけの返事が消えることはない。
+    # 途中で切れたとき（画面を開き直した等）は answering が残り、次にこの会話の画面を作ったときに送り直す
+    if _busy:
+        try:
+            with _answer_slot:
+                _ok = send_and_stream(_job["prompt"])
+        except Exception as _e:
+            print(f"[chat] error {type(_e).__name__}: {str(_e).strip()[:200]}", file=sys.stderr, flush=True)
+            st.session_state.last_error = CHAT_ERROR_MSG
+            _ok = False
+        _finish_answer(_job, _ok)
+        st.rerun()
 
 # =============================================================
 # 管理画面
